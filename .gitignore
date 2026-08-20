@@ -1,0 +1,17 @@
+# Local test artifacts
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Secrets / credentials
+.env
+*.secret
+*.key
+*.pem
+auth.json
+
+# Proxmox-generated files
+*.img
+*.qcow2
+*.raw
