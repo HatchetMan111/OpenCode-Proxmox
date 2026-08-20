@@ -263,10 +263,24 @@ write_files:
       BIN="\$HOME_DIR/.opencode/bin/opencode"
       PROJECTS="\$HOME_DIR/projects"
 
-      echo "[2/7] Erstelle Verzeichnisse ..."
+      echo "[2/7] Erstelle Verzeichnisse und Konfiguration ..."
       install -d -o "\$USER" -g "\$USER" "\$PROJECTS"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.local/share"
+      install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config/opencode"
+
+      cat >"\$HOME_DIR/.config/opencode/opencode.json" <<'JSON'
+      {
+        "\$schema": "https://opencode.ai/config.json",
+        "autoupdate": false,
+        "server": {
+          "port": ${OPENCODE_PORT},
+          "hostname": "0.0.0.0",
+          "mdns": false
+        }
+      }
+      JSON
+      chown "\$USER:\$USER" "\$HOME_DIR/.config/opencode/opencode.json"
 
       echo "[3/7] Installiere OpenCode ..."
       if [[ ! -x "\$BIN" ]]; then
@@ -471,84 +485,65 @@ wait_for_ip() {
 }
 
 # Wait for opencode-setup to finish inside the VM. If cloud-init's runcmd
-# hasn't run it within a few minutes, drive the setup directly via the
-# QEMU guest agent as a reliable fallback.
+# never fires, drive the setup directly via the QEMU guest agent once
+# cloud-init has finished (avoids concurrent apt/dpkg conflicts).
+vm_setup_done() {
+  local rc
+  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  [[ "$rc" == "0" ]]
+}
+
+vm_setup_log_exists() {
+  local rc
+  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/log/opencode-setup.log 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  [[ "$rc" == "0" ]]
+}
+
 wait_for_setup() {
-  local i rc pid exited exitcode
+  local i status fallback_sent=no pid exited exitcode
 
-  info "Warte bis opencode-setup in der VM abgeschlossen ist ..."
+  info "Warte bis opencode-setup in der VM abgeschlossen ist (bis zu 15 Min) ..."
 
-  # 1) Wait for cloud-init to finish (it may still be installing packages).
-  for i in {1..60}; do
-    rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-    if [[ "$rc" == "0" ]]; then
-      ok "opencode-setup bereits abgeschlossen (Marker gefunden)."
+  for i in {1..180}; do
+    if vm_setup_done; then
+      ok "opencode-setup abgeschlossen (Marker gefunden)."
       return 0
     fi
-    if (( i % 6 == 0 )); then
-      info "Warte auf cloud-init ... (${i}/60)"
+
+    status="$(exec_guest cloud-init status 2>/dev/null | grep -oE 'status: [a-z]+' | head -n1 | awk '{print $2}')"
+    status="${status:-unknown}"
+
+    # Only fall back to the guest agent once cloud-init has finished, so we
+    # never run two apt/dpkg processes at the same time.
+    if [[ "$fallback_sent" == "no" && ! vm_setup_log_exists && "$status" == "done" ]]; then
+      warn "cloud-init hat opencode-setup nicht ausgeführt. Starte es über den Guest Agent ..."
+      pid="$(qm guest exec "$VMID" --synchronous 0 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' 2>/dev/null | jq -r '.pid // empty' 2>/dev/null || true)"
+      if [[ -n "$pid" ]]; then
+        info "opencode-setup gestartet in der VM (PID ${pid})."
+      else
+        info "Führe opencode-setup synchron über den Guest Agent aus (bis zu 10 Min) ..."
+        qm guest exec "$VMID" --timeout 600 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' >/dev/null 2>&1 || true
+      fi
+      fallback_sent=yes
+    fi
+
+    if (( i % 12 == 0 )); then
+      info "Warte weiter ... (${i}/180) cloud-init: ${status}"
     fi
     sleep 5
   done
 
-  # 2) Marker not found after 5 min. Check if the setup script exists.
-  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  if [[ "$rc" != "0" ]]; then
-    warn "Setup-Skript in der VM nicht gefunden — cloud-init hat die Konfiguration"
-    warn "wahrscheinlich nicht angewendet. Prüfe cloud-init in der VM:"
-    warn "  qm terminal ${VMID}  →  cloud-init status --long"
-    warn "  cat /var/lib/cloud-init/instance-user-data.cfg"
-    return 1
+  if vm_setup_done; then
+    ok "opencode-setup abgeschlossen."
+    return 0
   fi
 
-  # 3) Script exists but marker missing — runcmd hasn't fired (or failed).
-  #    Run opencode-setup directly via the guest agent as a fallback.
-  warn "cloud-init hat opencode-setup nicht ausgeführt. Starte es über den Guest Agent ..."
-  pid="$(qm guest exec "$VMID" --synchronous 0 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' 2>/dev/null | jq -r '.pid // empty' 2>/dev/null || true)"
-
-  if [[ -z "$pid" ]]; then
-    # Synchronous fallback (older agent or --synchronous 0 unsupported)
-    info "Führe opencode-setup synchron über Guest Agent aus (bis zu 10 Min) ..."
-    qm guest exec "$VMID" --timeout 600 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' >/dev/null 2>&1 || true
-  else
-    info "opencode-setup gestartet (PID ${pid} in der VM). Warte auf Abschluss ..."
-    for i in {1..120}; do
-      exited="$(qm guest exec-status "$VMID" "$pid" 2>/dev/null | jq -r '.exited // 0' 2>/dev/null || true)"
-      if [[ "$exited" == "1" ]]; then
-        exitcode="$(qm guest exec-status "$VMID" "$pid" 2>/dev/null | jq -r '.exitcode // 1' 2>/dev/null || true)"
-        if [[ "$exitcode" == "0" ]]; then
-          ok "opencode-setup über Guest Agent abgeschlossen."
-          return 0
-        else
-          warn "opencode-setup fehlgeschlagen (Exit-Code ${exitcode})."
-          return 1
-        fi
-      fi
-      if (( i % 6 == 0 )); then
-        info "Warte auf opencode-setup ... (${i}/120)"
-      fi
-      sleep 5
-    done
-    warn "Timeout: opencode-setup nach 10 Min nicht abgeschlossen."
-    return 1
-  fi
-
-  # 4) After synchronous run, check marker.
-  for i in {1..30}; do
-    rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-    if [[ "$rc" == "0" ]]; then
-      ok "opencode-setup über Guest Agent abgeschlossen."
-      return 0
-    fi
-    sleep 5
-  done
-
-  warn "opencode-setup auch über Guest Agent nicht abgeschlossen."
+  warn "opencode-setup wurde in 15 Minuten nicht abgeschlossen."
   return 1
 }
 
 wait_for_service() {
-  local port=0 i
+  local port=0 http_code i
   info "Warte auf OpenCode Web (bis zu 10 Minuten, erste Einrichtung läuft) ..."
 
   for i in {1..300}; do
@@ -557,6 +552,12 @@ wait_for_service() {
       if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
         "http://${VM_IP}:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
         ok "OpenCode Web ist erreichbar."
+        return
+      fi
+      http_code="$(curl -s --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
+        -o /dev/null -w '%{http_code}' "http://${VM_IP}:${OPENCODE_PORT}/" 2>/dev/null || true)"
+      if [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
+        ok "OpenCode Web antwortet (HTTP ${http_code})."
         return
       fi
     fi
