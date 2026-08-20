@@ -248,22 +248,32 @@ write_files:
     content: |
       #!/usr/bin/env bash
       set -Eeuo pipefail
+      trap 'echo "FEHLER in Zeile \$LINENO: \$BASH_COMMAND" >&2' ERR
+
+      echo "=== opencode-setup gestartet: \$(date -Is) ==="
+
+      export DEBIAN_FRONTEND=noninteractive
+      echo "[1/7] Installiere Abhaengigkeiten ..."
+      apt-get update
+      apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent
 
       USER="opencode"
       HOME_DIR="/home/opencode"
       BIN="\$HOME_DIR/.opencode/bin/opencode"
       PROJECTS="\$HOME_DIR/projects"
 
+      echo "[2/7] Erstelle Verzeichnisse ..."
       install -d -o "\$USER" -g "\$USER" "\$PROJECTS"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.local/share"
 
+      echo "[3/7] Installiere OpenCode ..."
       if [[ ! -x "\$BIN" ]]; then
         runuser -u "\$USER" -- env HOME="\$HOME_DIR" bash -lc 'curl -fsSL https://opencode.ai/install | bash'
       fi
-
       test -x "\$BIN"
 
+      echo "[4/7] Erstelle systemd-Unit ..."
       cat >/etc/systemd/system/opencode.service <<'UNIT'
       [Unit]
       Description=OpenCode Web Server
@@ -303,6 +313,7 @@ write_files:
       VERSION
       chmod 0755 /usr/local/bin/opencode-version
 
+      echo "[5/7] Konfiguriere Firewall ..."
       # Local-network-only firewall. No public/WAN address is intentionally opened.
       ufw --force reset
       ufw default deny incoming
@@ -315,8 +326,10 @@ write_files:
       ufw allow from 192.168.0.0/16 to any port 22 proto tcp
       ufw --force enable
 
+      echo "[6/7] Bereite Verzeichnisse vor ..."
       chown -R opencode:opencode "\$PROJECTS" "\$HOME_DIR/.config" "\$HOME_DIR/.local/share"
 
+      echo "[7/7] Starte Dienste ..."
       systemctl daemon-reload
       systemctl enable --now qemu-guest-agent.service
       systemctl enable --now opencode.service
@@ -325,6 +338,8 @@ write_files:
       install -d -m 0755 /var/lib/opencode
       date -Is >/var/lib/opencode/installed-at
       chmod 0644 /var/lib/opencode/installed-at
+
+      echo "=== opencode-setup abgeschlossen: \$(date -Is) ==="
 
 runcmd:
   - [bash, -lc, "/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1"]
@@ -436,6 +451,83 @@ wait_for_ip() {
   done
 
   die "Keine IPv4-Adresse über den QEMU Guest Agent erhalten. Prüfe die VM-Konsole."
+}
+
+# Wait for opencode-setup to finish inside the VM. If cloud-init's runcmd
+# hasn't run it within a few minutes, drive the setup directly via the
+# QEMU guest agent as a reliable fallback.
+wait_for_setup() {
+  local i rc pid exited exitcode
+
+  info "Warte bis opencode-setup in der VM abgeschlossen ist ..."
+
+  # 1) Wait for cloud-init to finish (it may still be installing packages).
+  for i in {1..60}; do
+    rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+    if [[ "$rc" == "0" ]]; then
+      ok "opencode-setup bereits abgeschlossen (Marker gefunden)."
+      return 0
+    fi
+    if (( i % 6 == 0 )); then
+      info "Warte auf cloud-init ... (${i}/60)"
+    fi
+    sleep 5
+  done
+
+  # 2) Marker not found after 5 min. Check if the setup script exists.
+  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  if [[ "$rc" != "0" ]]; then
+    warn "Setup-Skript in der VM nicht gefunden — cloud-init hat die Konfiguration"
+    warn "wahrscheinlich nicht angewendet. Prüfe cloud-init in der VM:"
+    warn "  qm terminal ${VMID}  →  cloud-init status --long"
+    warn "  cat /var/lib/cloud-init/instance-user-data.cfg"
+    return 1
+  fi
+
+  # 3) Script exists but marker missing — runcmd hasn't fired (or failed).
+  #    Run opencode-setup directly via the guest agent as a fallback.
+  warn "cloud-init hat opencode-setup nicht ausgeführt. Starte es über den Guest Agent ..."
+  pid="$(qm guest exec "$VMID" --synchronous 0 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' 2>/dev/null | jq -r '.pid // empty' 2>/dev/null || true)"
+
+  if [[ -z "$pid" ]]; then
+    # Synchronous fallback (older agent or --synchronous 0 unsupported)
+    info "Führe opencode-setup synchron über Guest Agent aus (bis zu 10 Min) ..."
+    qm guest exec "$VMID" --timeout 600 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' >/dev/null 2>&1 || true
+  else
+    info "opencode-setup gestartet (PID ${pid} in der VM). Warte auf Abschluss ..."
+    for i in {1..120}; do
+      exited="$(qm guest exec-status "$VMID" "$pid" 2>/dev/null | jq -r '.exited // 0' 2>/dev/null || true)"
+      if [[ "$exited" == "1" ]]; then
+        exitcode="$(qm guest exec-status "$VMID" "$pid" 2>/dev/null | jq -r '.exitcode // 1' 2>/dev/null || true)"
+        if [[ "$exitcode" == "0" ]]; then
+          ok "opencode-setup über Guest Agent abgeschlossen."
+          return 0
+        else
+          warn "opencode-setup fehlgeschlagen (Exit-Code ${exitcode})."
+          return 1
+        fi
+      fi
+      if (( i % 6 == 0 )); then
+        info "Warte auf opencode-setup ... (${i}/120)"
+      fi
+      sleep 5
+    done
+    warn "Timeout: opencode-setup nach 10 Min nicht abgeschlossen."
+    return 1
+  fi
+
+  # 4) After synchronous run, check marker.
+  for i in {1..30}; do
+    rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+    if [[ "$rc" == "0" ]]; then
+      ok "opencode-setup über Guest Agent abgeschlossen."
+      return 0
+    fi
+    sleep 5
+  done
+
+  warn "opencode-setup auch über Guest Agent nicht abgeschlossen."
+  return 1
 }
 
 wait_for_service() {
@@ -577,6 +669,7 @@ main() {
   create_cloud_init
   create_vm
   wait_for_ip
+  wait_for_setup || true
   wait_for_service
   print_result
 }
