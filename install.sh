@@ -396,13 +396,16 @@ get_ip() {
 }
 
 # Run a command inside the VM via the QEMU guest agent and print its decoded
-# stdout/stderr. Silent when the agent is not available.
+# stdout/stderr. Never fails and never triggers the ERR trap.
 exec_guest() {
   local raw out err
   raw="$(qm guest exec "$VMID" --timeout 10 -- "$@" 2>/dev/null || true)"
-  out="$(printf '%s' "$raw" | jq -r '.out-data // empty' 2>/dev/null | base64 -d 2>/dev/null)"
-  err="$(printf '%s' "$raw" | jq -r '.err-data // empty' 2>/dev/null | base64 -d 2>/dev/null)"
+  out="$(printf '%s' "$raw" | jq -r '.out-data // empty' 2>/dev/null || true)"
+  err="$(printf '%s' "$raw" | jq -r '.err-data // empty' 2>/dev/null || true)"
+  [[ -n "$out" ]] && out="$(printf '%s' "$out" | base64 -d 2>/dev/null || true)"
+  [[ -n "$err" ]] && err="$(printf '%s' "$err" | base64 -d 2>/dev/null || true)"
   printf '%s%s' "$out" "$err"
+  return 0
 }
 
 # Pull the first useful diagnostic triage from the guest and show it.
@@ -410,11 +413,11 @@ vm_triage() {
   info "Sammle automatische Diagnose aus der VM ..."
   echo
   echo "----- /var/log/opencode-setup.log (Ende) -----"
-  exec_guest cat /var/log/opencode-setup.log 2>/dev/null | tail -n 30
+  exec_guest cat /var/log/opencode-setup.log | tail -n 30
   echo "----- opencode.service: is-active ----"
-  echo "Status: $(exec_guest systemctl is-active opencode 2>/dev/null)"
+  echo "Status: $(exec_guest systemctl is-active opencode)"
   echo "----- opencode.service: journal (Ende) -----"
-  exec_guest journalctl -u opencode -n 25 --no-pager 2>/dev/null
+  exec_guest journalctl -u opencode -n 25 --no-pager
   echo "----- Ende Diagnose -----"
 }
 
@@ -436,10 +439,10 @@ wait_for_ip() {
 }
 
 wait_for_service() {
-  info "Warte auf OpenCode Web ..."
+  local port=0 i
+  info "Warte auf OpenCode Web (bis zu 10 Minuten, erste Einrichtung läuft) ..."
 
-  local port=0
-  for _ in {1..180}; do
+  for i in {1..300}; do
     if timeout 3 bash -c "</dev/tcp/${VM_IP}/${OPENCODE_PORT}" >/dev/null 2>&1; then
       port=1
       if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
@@ -447,6 +450,16 @@ wait_for_service() {
         ok "OpenCode Web ist erreichbar."
         return
       fi
+    fi
+    if (( i % 30 == 0 )); then
+      local snippet rc
+      rc="$(qm guest exec "$VMID" --timeout 10 -- test -f /var/log/opencode-setup.log 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+      if [[ "$rc" == "0" ]]; then
+        snippet="Setup gestartet"
+      else
+        snippet="cloud-init läuft noch (setup-log fehlt)"
+      fi
+      info "Warte weiter ... (${i}/300) ${snippet}"
     fi
     sleep 2
   done
@@ -459,6 +472,9 @@ wait_for_service() {
     warn "Die Ersteinrichtung dauert nach dem Boot einige Minuten."
   fi
 
+  vm_triage
+  sleep 150
+  warn "Zweite Diagnose (falls cloud-init noch lief) ..."
   vm_triage
 
   warn "Falls die Diagnose leer bleibt, läuft cloud-init in der VM noch und der"
