@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.7.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_VERSION="24.04"
@@ -20,6 +20,8 @@ readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
 readonly OPENCODE_PORT="4096"
 
 VMID=""
+SSH_KEY="/root/.ssh/id_ed25519"
+SSH_PUBKEY="${SSH_KEY}.pub"
 VM_NAME="${VM_NAME_DEFAULT}"
 HOSTNAME="${HOSTNAME_DEFAULT}"
 STORAGE=""
@@ -27,7 +29,6 @@ BRIDGE="vmbr0"
 DISK="32G"
 RAM="8192"
 CORES="${CORES:-2}"
-CI_USER="opencode"
 CI_PASSWORD=""
 SERVER_PASSWORD=""
 IMAGE_PATH=""
@@ -170,6 +171,35 @@ prepare_credentials() {
   SERVER_PASSWORD="$(random_password)"
 }
 
+ensure_ssh_key() {
+  if [[ ! -f "$SSH_KEY" ]]; then
+    command -v ssh-keygen >/dev/null || die "ssh-keygen fehlt."
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    info "Erzeuge SSH-Keysatz für den VM-Zugriff ($SSH_KEY) ..."
+    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "opencode-proxmox" >/dev/null || die "SSH-Key konnte nicht erzeugt werden."
+  fi
+}
+
+# Run a command inside the VM over SSH (root key login). Silent on failure.
+sshe() {
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=5 -o PreferredAuthentications=publickey -o BatchMode=yes \
+    "root@${VM_IP}" "$@"
+}
+
+ssh_ready() {
+  sshe true >/dev/null 2>&1
+}
+
+ssh_has_marker() {
+  sshe "test -f /var/lib/opencode/installed-at" >/dev/null 2>&1
+}
+
+ssh_setup_running() {
+  sshe "pgrep -f /usr/local/sbin/opencode-setup >/dev/null" >/dev/null 2>&1
+}
+
 download_image() {
   local dir="/var/lib/vz/template/iso"
   mkdir -p "$dir"
@@ -253,6 +283,18 @@ write_files:
       trap 'echo "FEHLER in Zeile \$LINENO: \$BASH_COMMAND" >&2' ERR
 
       echo "=== opencode-setup gestartet: \$(date -Is) ==="
+
+      # The cloud-init user is now "root" (ciuser=root), so create the
+      # dedicated opencode user here and give it the web password as its
+      # shell password as well.
+      if ! getent passwd opencode >/dev/null; then
+        useradd -m -s /bin/bash opencode
+        echo 'opencode ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/opencode
+      fi
+      if [[ -r /etc/opencode/server.env ]]; then
+        local_pw="\$(grep '^OPENCODE_SERVER_PASSWORD=' /etc/opencode/server.env | cut -d= -f2- || true)"
+        [[ -n "\$local_pw" ]] && echo "opencode:\$local_pw" | chpasswd
+      fi
 
       export DEBIAN_FRONTEND=noninteractive
       echo "[1/7] Installiere Abhaengigkeiten ..."
@@ -402,8 +444,9 @@ create_vm() {
   qm set "$VMID" --ide2 "$STORAGE:cloudinit" >/dev/null
 
   qm set "$VMID" \
-    --ciuser "$CI_USER" \
+    --ciuser root \
     --cipassword "$CI_PASSWORD" \
+    --sshkeys "$SSH_PUBKEY" \
     --ipconfig0 ip=dhcp \
     --nameserver "1.1.1.1 9.9.9.9" \
     --cicustom "user=${SNIPPET_STORAGE}:snippets/$(basename "$SNIPPET_PATH")" \
@@ -427,42 +470,23 @@ get_ip() {
     head -n1 || true
 }
 
-# Run a command inside the VM via the QEMU guest agent and print its decoded
-# stdout/stderr. Never fails and never triggers the ERR trap.
-exec_guest() {
-  local raw out err
-  raw="$(qm guest exec "$VMID" --timeout 10 -- "$@" 2>/dev/null || true)"
-  out="$(printf '%s' "$raw" | jq -r '.out-data // empty' 2>/dev/null || true)"
-  err="$(printf '%s' "$raw" | jq -r '.err-data // empty' 2>/dev/null || true)"
-  [[ -n "$out" ]] && out="$(printf '%s' "$out" | base64 -d 2>/dev/null || true)"
-  [[ -n "$err" ]] && err="$(printf '%s' "$err" | base64 -d 2>/dev/null || true)"
-  printf '%s%s' "$out" "$err"
-  return 0
-}
-
-# Pull the decisive diagnostic from the guest and show it.
+# Pull the decisive diagnostics from the VM over SSH (guest exec is
+# unreliable on this node) and show them.
 vm_triage() {
-  local rc_host rc_script rc_env agent_host
+  local l="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@${VM_IP}"
   echo
-  info "Sammle Diagnose aus der VM ..."
-  echo "----- QEMU Guest Agent ----"
-  agent_host="$(qm guest cmd "$VMID" get-host-name 2>/dev/null | jq -r '."host-name" // empty' 2>/dev/null || true)"
-  echo "Agent liefert Hostname: ${agent_host:-<keine Antwort>}"
-  echo
+  info "Sammle Diagnose aus der VM (SSH) ..."
   echo "----- Wurde unsere Cloud-Init-Konfiguration angewendet? -----"
-  rc_host="$(qm guest exec "$VMID" --timeout 5 -- test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  rc_script="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  rc_env="$(qm guest exec "$VMID" --timeout 5 -- test -f /etc/opencode/server.env 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  echo "cloud-init user-data in der VM: $([[ "$rc_host" == "0" ]] && echo 'vorhanden' || echo 'FEHLT — Konfiguration NICHT angewendet')"
-  echo "opencode-setup-Skript:         $([[ "$rc_script" == "0" ]] && echo 'vorhanden' || echo 'FEHLT — write_files lief nicht')"
-  echo "server.env:                    $([[ "$rc_env" == "0" ]] && echo 'vorhanden' || echo 'FEHLT')"
+  $l "test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null; echo exit=\$?" 2>/dev/null || echo "SSH nicht erreichbar"
+  $l "test -f /usr/local/sbin/opencode-setup 2>/dev/null; echo exit=\$?" 2>/dev/null
+  $l "test -f /etc/opencode/server.env 2>/dev/null; echo exit=\$?" 2>/dev/null
   echo
   echo "----- /var/log/opencode-setup.log (Ende) -----"
-  exec_guest cat /var/log/opencode-setup.log 2>/dev/null | tail -n 30
+  $l "tail -n 30 /var/log/opencode-setup.log 2>/dev/null || echo '<kein Setup-Log>'" 2>/dev/null
   echo "----- opencode.service: is-active ----"
-  echo "Status: $(exec_guest systemctl is-active opencode 2>/dev/null)"
+  $l "systemctl is-active opencode 2>/dev/null || echo '<inaktiv>'" 2>/dev/null
   echo "----- opencode.service: journal (Ende) -----"
-  exec_guest journalctl -u opencode -n 25 --no-pager 2>/dev/null
+  $l "journalctl -u opencode -n 25 --no-pager 2>/dev/null || echo '<kein Journal>'" 2>/dev/null
   echo "----- Ende Diagnose -----"
 }
 
@@ -499,100 +523,68 @@ wait_for_ip() {
   die "Keine IPv4-Adresse über den QEMU Guest Agent erhalten. Prüfe die VM-Konsole."
 }
 
-# Wait for opencode-setup to finish inside the VM. If cloud-init's runcmd
-# never fires, drive the setup directly via the QEMU guest agent once
-# cloud-init has finished (avoids concurrent apt/dpkg conflicts).
-vm_setup_done() {
-  local rc
-  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  [[ "$rc" == "0" ]]
-}
-
-vm_setup_log_exists() {
-  local rc
-  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /var/log/opencode-setup.log 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  [[ "$rc" == "0" ]]
-}
-
-# Deliver opencode-setup and /etc/opencode/server.env into the VM directly via
-# the QEMU guest agent (base64). This is the reliable provisioning path: some
-# environments never apply a `cicustom` user-data snippet, so we must not
-# depend on cloud-init write_files for the essential files.
-provision_files_via_agent() {
-  local rc script_b64 env_b64
-
-  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  [[ "$rc" == "0" ]] && return 0
-
-  info "Übergebe opencode-setup und server.env direkt in die VM (Guest-Agent) ..."
-  script_b64="$(sed -n '/# BEGIN_OPENCODE_SETUP/,/# END_OPENCODE_SETUP/p' "$SNIPPET_PATH" | sed '1d;$d' | sed 's/^      //' | base64 -w0 2>/dev/null)"
-  env_b64="$(printf 'OPENCODE_SERVER_USERNAME=opencode\nOPENCODE_SERVER_PASSWORD=%s' "$SERVER_PASSWORD" | base64 -w0)"
-
-  if [[ -z "$script_b64" || -z "$env_b64" ]]; then
-    warn "Konnte Setup-Inhalt nicht kodieren."
-    return 1
-  fi
-
-  qm guest exec "$VMID" -- bash -c "echo $script_b64 | base64 -d > /usr/local/sbin/opencode-setup && chmod 0755 /usr/local/sbin/opencode-setup" >/dev/null 2>&1 || true
-  qm guest exec "$VMID" -- bash -c "install -d -m 0700 /etc/opencode && echo $env_b64 | base64 -d > /etc/opencode/server.env && chmod 0600 /etc/opencode/server.env" >/dev/null 2>&1 || true
-
-  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-  if [[ "$rc" == "0" ]]; then
-    ok "Dateien in die VM geschrieben."
-    return 0
-  fi
-  warn "Schreiben der Dateien in die VM fehlgeschlagen (Guest-Agent-Exec nicht verfügbar?)."
-  return 1
-}
-
+# Wait for opencode-setup to finish inside the VM, driving it over SSH.
 wait_for_setup() {
-  local i status fallback_sent=no pid exited exitcode
+  local i
 
   info "Warte bis opencode-setup in der VM abgeschlossen ist (bis zu 15 Min) ..."
 
-  # Make sure the provisioning files exist in the VM first. If cloud-init
-  # never applied our user-data snippet, push them via the guest agent.
-  if ! vm_setup_done && ! provision_files_via_agent; then
-    warn "Provisionierung der Dateien in die VM fehlgeschlagen."
+  # 0) Wait until the VM accepts SSH as root (cloud-init injected our key).
+  info "Warte auf SSH-Zugang zur VM (root@${VM_IP}) ..."
+  for i in {1..36}; do
+    if ssh_ready; then
+      ok "SSH-Zugang verfügbar."
+      break
+    fi
+    if (( i % 6 == 0 )); then
+      info "Warte auf SSH ... (${i}/36)"
+    fi
+    sleep 5
+  done
+  if ! ssh_ready; then
+    warn "Kein SSH-Zugang zu ${VM_IP} (Cloud-Init hat den Key nicht angewendet?)."
     return 1
   fi
 
-  for i in {1..180}; do
-    if vm_setup_done; then
+  # 1) Push the provisioning files if they are missing.
+  if ! sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1; then
+    info "Übergebe opencode-setup und server.env per SSH in die VM ..."
+    sed -n '/# BEGIN_OPENCODE_SETUP/,/# END_OPENCODE_SETUP/p' "$SNIPPET_PATH" | \
+      sed '1d;$d' | sed 's/^      //' |
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 "root@${VM_IP}" \
+        'cat > /usr/local/sbin/opencode-setup && chmod 0755 /usr/local/sbin/opencode-setup' 2>/dev/null || true
+    printf 'OPENCODE_SERVER_USERNAME=opencode\nOPENCODE_SERVER_PASSWORD=%s\n' "$SERVER_PASSWORD" |
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 "root@${VM_IP}" \
+        'install -d -m 0700 /etc/opencode && cat > /etc/opencode/server.env && chmod 0600 /etc/opencode/server.env' 2>/dev/null || true
+  fi
+  if ! sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1; then
+    warn "Übertragen der Dateien per SSH fehlgeschlagen."
+    return 1
+  fi
+  ok "opencode-setup und server.env sind in der VM."
+
+  # 2) Start the setup only if it has not run yet (marker check) and is not
+  #    already being driven by cloud-init's runcmd.
+  if ! ssh_has_marker && ! ssh_setup_running; then
+    info "Starte opencode-setup in der VM (per SSH) ..."
+    sshe "nohup /usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1 < /dev/null &" >/dev/null 2>&1 || true
+  fi
+
+  # 3) Wait for the marker.
+  for i in {1..120}; do
+    if ssh_has_marker; then
       ok "opencode-setup abgeschlossen (Marker gefunden)."
       return 0
     fi
-
-    status="$(exec_guest cloud-init status 2>/dev/null | grep -oE 'status: [a-z]+' | head -n1 | awk '{print $2}')"
-    status="${status:-unknown}"
-
-    # Only fall back to the guest agent once cloud-init is not running anymore,
-    # so we never run two apt/dpkg processes at the same time. Both "done",
-    # "error" and an unavailable status ("unknown") allow the fallback.
-    if [[ "$fallback_sent" == "no" && ! vm_setup_log_exists && "$status" != "running" && "$i" -ge 18 ]]; then
-      warn "cloud-init hat opencode-setup nicht ausgeführt (Status: ${status}). Starte es über den Guest Agent ..."
-      pid="$(qm guest exec "$VMID" --synchronous 0 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' 2>/dev/null | jq -r '.pid // empty' 2>/dev/null || true)"
-      if [[ -n "$pid" ]]; then
-        info "opencode-setup gestartet in der VM (PID ${pid})."
-      else
-        info "Führe opencode-setup synchron über den Guest Agent aus (bis zu 10 Min) ..."
-        qm guest exec "$VMID" --timeout 600 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' >/dev/null 2>&1 || true
-      fi
-      fallback_sent=yes
-    fi
-
     if (( i % 12 == 0 )); then
-      info "Warte weiter ... (${i}/180) cloud-init: ${status}"
+      info "Warte auf opencode-setup ... (${i}/120)"
     fi
     sleep 5
   done
 
-  if vm_setup_done; then
-    ok "opencode-setup abgeschlossen."
-    return 0
-  fi
-
-  warn "opencode-setup wurde in 15 Minuten nicht abgeschlossen."
+  warn "opencode-setup wurde in 10 Minuten nicht abgeschlossen."
   return 1
 }
 
@@ -617,11 +609,10 @@ wait_for_service() {
     fi
     if (( i % 30 == 0 )); then
       local snippet rc
-      rc="$(qm guest exec "$VMID" --timeout 10 -- test -f /var/log/opencode-setup.log 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
-      if [[ "$rc" == "0" ]]; then
+      if sshe "test -f /var/log/opencode-setup.log" >/dev/null 2>&1; then
         snippet="Setup gestartet"
       else
-        snippet="cloud-init läuft noch (setup-log fehlt)"
+        snippet="opencode-setup läuft noch (setup-log fehlt)"
       fi
       info "Warte weiter ... (${i}/300) ${snippet}"
     fi
@@ -733,6 +724,7 @@ main() {
   choose_snippet_storage
   next_vmid
   prepare_credentials
+  ensure_ssh_key
 
   info "Storage: $STORAGE"
   info "Snippet-Storage: $SNIPPET_STORAGE"
@@ -751,7 +743,7 @@ main() {
     warn "Die Installation in der VM war nicht erfolgreich."
     warn "Verbinde dich zur VM-Konsole und prüfe:"
     warn "  qm terminal ${VMID}"
-    warn "  Login: opencode / ${CI_PASSWORD}"
+    warn "  Login: root / ${CI_PASSWORD}"
     warn "  cloud-init status --long"
     warn "  cat /var/log/opencode-setup.log"
     die "OpenCode-Installation in der VM fehlgeschlagen — siehe Diagnose oben."
