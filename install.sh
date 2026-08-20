@@ -477,9 +477,9 @@ vm_triage() {
   echo
   info "Sammle Diagnose aus der VM (SSH) ..."
   echo "----- Wurde unsere Cloud-Init-Konfiguration angewendet? -----"
-  $l "test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null; echo exit=\$?" 2>/dev/null || echo "SSH nicht erreichbar"
-  $l "test -f /usr/local/sbin/opencode-setup 2>/dev/null; echo exit=\$?" 2>/dev/null
-  $l "test -f /etc/opencode/server.env 2>/dev/null; echo exit=\$?" 2>/dev/null
+  $l "test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null && echo user-data vorhanden || echo user-data FEHLT" 2>/dev/null || echo "SSH nicht erreichbar"
+  $l "test -f /usr/local/sbin/opencode-setup 2>/dev/null && echo setup-script vorhanden || echo setup-script FEHLT" 2>/dev/null || true
+  $l "test -f /etc/opencode/server.env 2>/dev/null && echo server.env vorhanden || echo server.env FEHLT" 2>/dev/null || true
   echo
   echo "----- /var/log/opencode-setup.log (Ende) -----"
   $l "tail -n 30 /var/log/opencode-setup.log 2>/dev/null || echo '<kein Setup-Log>'" 2>/dev/null
@@ -542,7 +542,12 @@ wait_for_setup() {
     sleep 5
   done
   if ! ssh_ready; then
-    warn "Kein SSH-Zugang zu ${VM_IP} (Cloud-Init hat den Key nicht angewendet?)."
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/22" >/dev/null 2>&1; then
+      warn "SSH-Port 22 an ${VM_IP} ist NICHT erreichbar (Netzwerk/Firewall?)."
+    else
+      warn "SSH-Port 22 ist offen, aber Root-Login mit dem Key schlägt fehl."
+    fi
+    warn "Kein SSH-Zugang zu ${VM_IP}."
     return 1
   fi
 
