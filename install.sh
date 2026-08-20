@@ -11,6 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
+readonly SCRIPT_VERSION="1.4.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_VERSION="24.04"
@@ -25,7 +26,7 @@ STORAGE=""
 BRIDGE="vmbr0"
 DISK="32G"
 RAM="8192"
-CORES="4"
+CORES="${CORES:-2}"
 CI_USER="opencode"
 CI_PASSWORD=""
 SERVER_PASSWORD=""
@@ -439,7 +440,23 @@ vm_triage() {
 wait_for_ip() {
   info "Starte VM und warte auf QEMU Guest Agent ..."
 
-  qm start "$VMID" >/dev/null
+  if ! qm start "$VMID" >/dev/null 2>&1; then
+    # Some nodes restrict the number of vCPUs per VM (e.g. "MAX 2 vcpus
+    # allowed per VM on this node"). Detect the limit and re-adjust.
+    local err maxv
+    err="$(qm start "$VMID" 2>&1 || true)"
+    maxv="$(printf '%s' "$err" | grep -oiE 'MAX [0-9]+ vcpus' | grep -oE '[0-9]+' | head -n1)"
+    if [[ -n "$maxv" ]]; then
+      warn "Knoten erlaubt maximal ${maxv} vCPUs pro VM. Reduziere Cores auf ${maxv}."
+      qm set "$VMID" --cores "$maxv" >/dev/null
+      CORES="$maxv"
+      ok "VM-Konfiguration angepasst (Cores=${maxv})."
+      qm start "$VMID" >/dev/null || die "VM-Start fehlgeschlagen."
+    else
+      warn "VM-Start fehlgeschlagen."
+      die "${err:-Fehler beim Starten der VM}"
+    fi
+  fi
 
   for _ in {1..120}; do
     VM_IP="$(get_ip)"
@@ -654,6 +671,7 @@ EOF
 }
 
 main() {
+  info "${APP_NAME}-Proxmox Installer v${SCRIPT_VERSION}"
   require_root
   install_dependencies
   choose_storage
