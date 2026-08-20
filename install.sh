@@ -328,7 +328,6 @@ write_files:
 
 runcmd:
   - [bash, -lc, "/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1"]
-  - [bash, -lc, "cloud-init clean --logs || true"]
 
 final_message: "OpenCode VM provisioning finished."
 EOF
@@ -416,18 +415,31 @@ wait_for_ip() {
 wait_for_service() {
   info "Warte auf OpenCode Web ..."
 
+  local port=0
   for _ in {1..180}; do
-    if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
-      "http://${VM_IP}:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
-      ok "OpenCode Web ist erreichbar."
-      return
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/${OPENCODE_PORT}" >/dev/null 2>&1; then
+      port=1
+      if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
+        "http://${VM_IP}:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
+        ok "OpenCode Web ist erreichbar."
+        return
+      fi
     fi
     sleep 2
   done
 
-  warn "OpenCode ist noch nicht über den Health-Endpunkt erreichbar."
-  warn "Prüfe mit: qm terminal ${VMID}"
-  warn "Logs in der VM: journalctl -u opencode -f"
+  warn "OpenCode Web ist noch nicht bereit."
+  if [[ "$port" -eq 1 ]]; then
+    warn "Der Port ${OPENCODE_PORT} ist offen, aber der Dienst startet vermutlich gerade."
+  else
+    warn "Der Port ${OPENCODE_PORT} ist (noch) nicht erreichbar."
+    warn "Die Ersteinrichtung dauert nach dem Boot einige Minuten."
+  fi
+  warn "Prüfe in der VM (qm terminal ${VMID}):"
+  warn "  systemctl status opencode"
+  warn "  journalctl -u opencode -e"
+  warn "  cat /var/log/opencode-setup.log"
+  warn "  ip a"
 }
 
 print_result() {
@@ -480,6 +492,24 @@ print_result() {
   (10/8, 172.16/12, 192.168/16) durch die VM-Firewall erlaubt.
 
   Trotzdem keinen Router-Port-Forward auf ${OPENCODE_PORT} setzen.
+
+============================================================
+ TROUBLESHOOTING
+============================================================
+
+  Falls das Dashboard nicht lädt, verbinde dich zur VM:
+
+    qm terminal ${VMID}
+
+  und prüfe:
+
+    a. IP prüfen:  ip a
+    b. Dienst:     systemctl status opencode
+    c. Logs:       journalctl -u opencode -e
+    d. Setup-Log:  cat /var/log/opencode-setup.log
+
+  Die Ersteinrichtung installiert nach dem ersten Boot noch
+  einige Minuten lang Pakete und OpenCode.
 
 ============================================================
 
