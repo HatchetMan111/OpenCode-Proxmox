@@ -45,6 +45,8 @@ ok() { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
+trap 'die "Installation abgebrochen in Zeile ${LINENO}: ${BASH_COMMAND}"' ERR
+
 require_root() {
   [[ $EUID -eq 0 ]] || die "Dieses Script muss als root auf einem Proxmox VE Host ausgeführt werden."
   command -v qm >/dev/null || die "Proxmox qm wurde nicht gefunden."
@@ -59,6 +61,7 @@ install_dependencies() {
   command -v openssl >/dev/null || packages+=(openssl)
   command -v sha256sum >/dev/null || packages+=(coreutils)
   command -v awk >/dev/null || packages+=(gawk)
+  command -v jq >/dev/null || packages+=(jq)
 
   if ((${#packages[@]})); then
     info "Installiere benötigte Host-Pakete: ${packages[*]}"
