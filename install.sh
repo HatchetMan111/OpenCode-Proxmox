@@ -79,14 +79,14 @@ choose_storage() {
   local candidate
   for candidate in local-lvm local-zfs local; do
     if pvesm status --storage "$candidate" >/dev/null 2>&1; then
-      if pvesm status --storage "$candidate" | awk 'NR>1 {print $3}' | grep -q '^active$'; then
+      if pvesm status --storage "$candidate" 2>/dev/null | awk 'NR>1 {print $3}' | grep -q '^active$'; then
         STORAGE="$candidate"
         return
       fi
     fi
   done
 
-  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}' || true)"
+  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" && $1 !~ /:/ {print $1; exit}' || true)"
   [[ -n "$STORAGE" ]] || die "Kein aktiver Storage für VM-Disks gefunden."
 }
 
@@ -100,20 +100,20 @@ pvesm_cfg() {
 choose_snippet_storage() {
   local s cfg_type cfg_path content new_content
 
-  # Prefer an already configured snippet storage that is a directory.
+  # 1. Use an existing snippets-enabled directory storage.
   while read -r s; do
-    [[ -z "$s" ]] && continue
+    [[ -z "$s" || "$s" == *:* ]] && continue
     cfg_type="$(pvesm_cfg "$s" type)"
     cfg_path="$(pvesm_cfg "$s" path)"
     if [[ "$cfg_type" == "dir" && "$cfg_path" == /* && -d "$cfg_path" ]]; then
       SNIPPET_STORAGE="$s"
       return
     fi
-  done < <(pvesm status --content snippets 2>/dev/null | awk 'NR>1 {print $1}')
+  done < <(pvesm status --content snippets 2>/dev/null | awk 'NR>1 && $1 !~ /:/ {print $1}')
 
-  # Otherwise scan all storages for any directory storage and enable snippets.
+  # 2. Enable snippets on any existing directory storage.
   while read -r s; do
-    [[ -z "$s" ]] && continue
+    [[ -z "$s" || "$s" == *:* ]] && continue
     cfg_type="$(pvesm_cfg "$s" type)"
     cfg_path="$(pvesm_cfg "$s" path)"
     [[ "$cfg_type" == "dir" && "$cfg_path" == /* && -d "$cfg_path" ]] || continue
@@ -129,9 +129,21 @@ choose_snippet_storage() {
     mkdir -p "$cfg_path/snippets"
     SNIPPET_STORAGE="$s"
     return
-  done < <(pvesm status 2>/dev/null | awk 'NR>1 {print $1}')
+  done < <(pvesm status 2>/dev/null | awk 'NR>1 && $1 !~ /:/ {print $1}')
 
-  die "Kein Proxmox-Directory-Storage gefunden. Bitte 'snippets' auf einem Directory-Storage aktivieren."
+  # 3. No directory storage at all — create a dedicated one for snippets.
+  local new_id="opencode-snippets"
+  local new_path="/var/lib/opencode/snippets"
+
+  if pvesm status --storage "$new_id" >/dev/null 2>&1; then
+    SNIPPET_STORAGE="$new_id"
+    return
+  fi
+
+  info "Kein Directory-Storage gefunden. Lege Storage '$new_id' an."
+  mkdir -p "$new_path"
+  pvesm add dir "$new_id" --path "$new_path" --content snippets >/dev/null
+  SNIPPET_STORAGE="$new_id"
 }
 
 next_vmid() {
@@ -173,16 +185,10 @@ download_image() {
 }
 
 create_cloud_init() {
-  local snippet_dir="/var/lib/vz/snippets"
-
-  if [[ "$SNIPPET_STORAGE" == "local" ]]; then
-    snippet_dir="$(pvesm_cfg local path)/snippets"
-  else
-    local cfg_path
-    cfg_path="$(pvesm_cfg "$SNIPPET_STORAGE" path)"
-    [[ -n "$cfg_path" ]] || die "Snippet-Storage '$SNIPPET_STORAGE' hat keinen Directory-Pfad."
-    snippet_dir="$cfg_path/snippets"
-  fi
+  local cfg_path
+  cfg_path="$(pvesm_cfg "$SNIPPET_STORAGE" path)"
+  [[ -n "$cfg_path" ]] || die "Snippet-Storage '$SNIPPET_STORAGE' hat keinen Directory-Pfad."
+  local snippet_dir="$cfg_path/snippets"
 
   mkdir -p "$snippet_dir"
   SNIPPET_PATH="$snippet_dir/opencode-${VMID}.yaml"
