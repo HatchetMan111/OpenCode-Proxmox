@@ -90,11 +90,19 @@ choose_storage() {
   [[ -n "$STORAGE" ]] || die "Kein aktiver Storage für VM-Disks gefunden."
 }
 
-# Read a single value from `pvesm config <storage>` output. Robust against
-# leading whitespace and the "key:" or "key" output formats. Never aborts
-# under set -e even when the storage does not exist.
+# Read a single property for a storage from /etc/pve/storage.cfg. Storage
+# type is stored as the section header ('dir:', 'lvmthin:', ...), everything
+# else as indented '<key> <value>' lines. Works on any Proxmox host and
+# never aborts under set -e when the storage does not exist.
 pvesm_cfg() {
-  pvesm config "$1" 2>/dev/null | awk -v k="$2" '{gsub(/^[ \t]+/,"")} $1 ~ "^"k":?$" {print $2; exit}' || true
+  awk -v s="$1" -v k="$2" '
+    /^[^ \t]/ && $1 ~ /:$/ && $2 == s {
+      if (k == "type") { sub(/:$/, "", $1); print $1; exit }
+      in_section = 1
+      next
+    }
+    in_section && $1 == k { sub(/^[ \t]+/, ""); sub(/^[^ \t]+[ \t]+/, ""); print; exit }
+  ' /etc/pve/storage.cfg || true
 }
 
 choose_snippet_storage() {
