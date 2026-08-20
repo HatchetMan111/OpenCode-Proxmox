@@ -218,6 +218,9 @@ create_cloud_init() {
   cat >"$SNIPPET_PATH" <<EOF
 #cloud-config
 
+hostname: opencode
+manage_etc_hosts: true
+
 package_update: true
 package_upgrade: false
 
@@ -341,7 +344,6 @@ create_vm() {
 
   qm create "$VMID" \
     --name "$VM_NAME" \
-    --hostname "$HOSTNAME" \
     --memory "$RAM" \
     --cores "$CORES" \
     --cpu host \
