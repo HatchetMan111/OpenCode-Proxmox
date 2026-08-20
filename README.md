@@ -2,8 +2,6 @@
 
 One-command installer for running **OpenCode Web** permanently inside an isolated Ubuntu 24.04 LTS virtual machine on Proxmox VE.
 
-> This project is community-maintained and is not affiliated with or endorsed by OpenCode, Proxmox or Canonical.
-
 ## What it does
 
 The installer runs on a Proxmox VE host and automatically:
@@ -33,10 +31,8 @@ https://opencode.ai/docs/web/
 After publishing this repository to GitHub, run the following on your **Proxmox VE host as root**:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-USER/proxmox-opencode/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/OpenCode-Proxmox/main/install.sh)"
 ```
-
-Replace `YOUR-USER` with your GitHub username.
 
 ## Result
 

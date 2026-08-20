@@ -6,9 +6,7 @@
 # Installs OpenCode Web in an Ubuntu 24.04 LTS VM.
 #
 # Usage:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR-USER/proxmox-opencode/main/install.sh)"
-#
-# The installer is intentionally self-contained and runs on the Proxmox host.
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/OpenCode-Proxmox/main/install.sh)"
 
 set -Eeuo pipefail
 
