@@ -86,7 +86,7 @@ choose_storage() {
     fi
   done
 
-  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" && $1 !~ /:/ {print $1; exit}' || true)"
+  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" && $1 !~ /:/ && $2 != "pbs" {print $1; exit}' || true)"
   [[ -n "$STORAGE" ]] || die "Kein aktiver Storage für VM-Disks gefunden."
 }
 
@@ -109,7 +109,7 @@ choose_snippet_storage() {
       SNIPPET_STORAGE="$s"
       return
     fi
-  done < <(pvesm status --content snippets 2>/dev/null | awk 'NR>1 && $1 !~ /:/ {print $1}')
+  done < <(pvesm status --content snippets 2>/dev/null | awk 'NR>1 && $1 !~ /:/ && $2 != "pbs" {print $1}')
 
   # 2. Enable snippets on any existing directory storage.
   while read -r s; do
@@ -129,7 +129,7 @@ choose_snippet_storage() {
     mkdir -p "$cfg_path/snippets"
     SNIPPET_STORAGE="$s"
     return
-  done < <(pvesm status 2>/dev/null | awk 'NR>1 && $1 !~ /:/ {print $1}')
+  done < <(pvesm status 2>/dev/null | awk 'NR>1 && $1 !~ /:/ && $2 != "pbs" {print $1}')
 
   # 3. No directory storage at all — create a dedicated one for snippets.
   local new_id="opencode-snippets"
@@ -176,7 +176,7 @@ download_image() {
   local sums expected
   sums="$(mktemp)"
   curl -fsSL -o "$sums" "$UBUNTU_BASE/SHA256SUMS"
-  expected="$(awk -v f="$UBUNTU_IMAGE" '$2=="./"f || $2==f {print $1; exit}' "$sums")"
+  expected="$(awk -v f="$UBUNTU_IMAGE" '{sub(/^\*/, "", $2)} $2=="./"f || $2==f {print $1; exit}' "$sums")"
   rm -f "$sums"
 
   [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "SHA256 des Ubuntu Images konnte nicht aus SHA256SUMS gelesen werden."
