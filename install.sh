@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_VERSION="24.04"
@@ -438,16 +438,29 @@ exec_guest() {
   return 0
 }
 
-# Pull the first useful diagnostic triage from the guest and show it.
+# Pull the decisive diagnostic from the guest and show it.
 vm_triage() {
-  info "Sammle automatische Diagnose aus der VM ..."
+  local rc_host rc_script rc_env agent_host
+  echo
+  info "Sammle Diagnose aus der VM ..."
+  echo "----- QEMU Guest Agent ----"
+  agent_host="$(qm guest cmd "$VMID" get-host-name 2>/dev/null | jq -r '."host-name" // empty' 2>/dev/null || true)"
+  echo "Agent liefert Hostname: ${agent_host:-<keine Antwort>}"
+  echo
+  echo "----- Wurde unsere Cloud-Init-Konfiguration angewendet? -----"
+  rc_host="$(qm guest exec "$VMID" --timeout 5 -- test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  rc_script="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  rc_env="$(qm guest exec "$VMID" --timeout 5 -- test -f /etc/opencode/server.env 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  echo "cloud-init user-data in der VM: $([[ "$rc_host" == "0" ]] && echo 'vorhanden' || echo 'FEHLT — Konfiguration NICHT angewendet')"
+  echo "opencode-setup-Skript:         $([[ "$rc_script" == "0" ]] && echo 'vorhanden' || echo 'FEHLT — write_files lief nicht')"
+  echo "server.env:                    $([[ "$rc_env" == "0" ]] && echo 'vorhanden' || echo 'FEHLT')"
   echo
   echo "----- /var/log/opencode-setup.log (Ende) -----"
-  exec_guest cat /var/log/opencode-setup.log | tail -n 30
+  exec_guest cat /var/log/opencode-setup.log 2>/dev/null | tail -n 30
   echo "----- opencode.service: is-active ----"
-  echo "Status: $(exec_guest systemctl is-active opencode)"
+  echo "Status: $(exec_guest systemctl is-active opencode 2>/dev/null)"
   echo "----- opencode.service: journal (Ende) -----"
-  exec_guest journalctl -u opencode -n 25 --no-pager
+  exec_guest journalctl -u opencode -n 25 --no-pager 2>/dev/null
   echo "----- Ende Diagnose -----"
 }
 
@@ -513,10 +526,11 @@ wait_for_setup() {
     status="$(exec_guest cloud-init status 2>/dev/null | grep -oE 'status: [a-z]+' | head -n1 | awk '{print $2}')"
     status="${status:-unknown}"
 
-    # Only fall back to the guest agent once cloud-init has finished, so we
-    # never run two apt/dpkg processes at the same time.
-    if [[ "$fallback_sent" == "no" && ! vm_setup_log_exists && "$status" == "done" ]]; then
-      warn "cloud-init hat opencode-setup nicht ausgeführt. Starte es über den Guest Agent ..."
+    # Only fall back to the guest agent once cloud-init is not running anymore,
+    # so we never run two apt/dpkg processes at the same time. Both "done",
+    # "error" and an unavailable status ("unknown") allow the fallback.
+    if [[ "$fallback_sent" == "no" && ! vm_setup_log_exists && "$status" != "running" && "$i" -ge 18 ]]; then
+      warn "cloud-init hat opencode-setup nicht ausgeführt (Status: ${status}). Starte es über den Guest Agent ..."
       pid="$(qm guest exec "$VMID" --synchronous 0 -- bash -c '/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1' 2>/dev/null | jq -r '.pid // empty' 2>/dev/null || true)"
       if [[ -n "$pid" ]]; then
         info "opencode-setup gestartet in der VM (PID ${pid})."
@@ -686,11 +700,22 @@ main() {
 
   download_image
   create_cloud_init
+  [[ -s "$SNIPPET_PATH" ]] || die "Snippet '$SNIPPET_PATH' konnte nicht geschrieben werden."
   create_vm
   wait_for_ip
-  wait_for_setup || true
-  wait_for_service
-  print_result
+  if wait_for_setup; then
+    wait_for_service
+    print_result
+  else
+    vm_triage
+    warn "Die Installation in der VM war nicht erfolgreich."
+    warn "Verbinde dich zur VM-Konsole und prüfe:"
+    warn "  qm terminal ${VMID}"
+    warn "  Login: opencode / ${CI_PASSWORD}"
+    warn "  cloud-init status --long"
+    warn "  cat /var/log/opencode-setup.log"
+    die "OpenCode-Installation in der VM fehlgeschlagen — siehe Diagnose oben."
+  fi
 }
 
 main "$@"
