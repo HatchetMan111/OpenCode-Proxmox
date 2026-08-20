@@ -86,46 +86,52 @@ choose_storage() {
     fi
   done
 
-  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')"
+  STORAGE="$(pvesm status --content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}' || true)"
   [[ -n "$STORAGE" ]] || die "Kein aktiver Storage für VM-Disks gefunden."
 }
 
-choose_snippet_storage() {
-  local s type content path
+# Read a single value from `pvesm config <storage>` output. Robust against
+# leading whitespace and the "key:" or "key" output formats. Never aborts
+# under set -e even when the storage does not exist.
+pvesm_cfg() {
+  pvesm config "$1" 2>/dev/null | awk -v k="$2" '{gsub(/^[ \t]+/,"")} $1 ~ "^"k":?$" {print $2; exit}' || true
+}
 
-  # Prefer an already configured snippet storage.
+choose_snippet_storage() {
+  local s cfg_type cfg_path content new_content
+
+  # Prefer an already configured snippet storage that is a directory.
   while read -r s; do
     [[ -z "$s" ]] && continue
-    local cfg_type cfg_path
-    cfg_type="$(pvesm config "$s" 2>/dev/null | awk -F': ' '$1=="type"{print $2}')"
-    cfg_path="$(pvesm config "$s" 2>/dev/null | awk -F': ' '$1=="path"{print $2}')"
+    cfg_type="$(pvesm_cfg "$s" type)"
+    cfg_path="$(pvesm_cfg "$s" path)"
     if [[ "$cfg_type" == "dir" && "$cfg_path" == /* && -d "$cfg_path" ]]; then
       SNIPPET_STORAGE="$s"
       return
     fi
   done < <(pvesm status --content snippets 2>/dev/null | awk 'NR>1 {print $1}')
 
-  # Most installations have a directory storage named "local".
-  if pvesm status --storage local >/dev/null 2>&1; then
-    type="$(pvesm config local 2>/dev/null | awk -F': ' '$1=="type"{print $2}')"
-    path="$(pvesm config local 2>/dev/null | awk -F': ' '$1=="path"{print $2}')"
-    content="$(pvesm config local 2>/dev/null | awk -F': ' '$1=="content"{print $2}')"
+  # Otherwise scan all storages for any directory storage and enable snippets.
+  while read -r s; do
+    [[ -z "$s" ]] && continue
+    cfg_type="$(pvesm_cfg "$s" type)"
+    cfg_path="$(pvesm_cfg "$s" path)"
+    [[ "$cfg_type" == "dir" && "$cfg_path" == /* && -d "$cfg_path" ]] || continue
 
-    if [[ "$type" == "dir" && "$path" == /* ]]; then
-      if [[ "$content" != *snippets* ]]; then
-        info "Aktiviere Proxmox-Snippets auf Storage 'local'."
-        local new_content="$content"
-        [[ -n "$new_content" ]] && new_content+=","
-        new_content+="snippets"
-        pvesm set local --content "$new_content" >/dev/null
-      fi
-      mkdir -p "$path/snippets"
-      SNIPPET_STORAGE="local"
-      return
+    content="$(pvesm_cfg "$s" content)"
+    if [[ "$content" != *snippets* ]]; then
+      info "Aktiviere Proxmox-Snippets auf Storage '$s'."
+      new_content="$content"
+      [[ -n "$new_content" ]] && new_content+=","
+      new_content+="snippets"
+      pvesm set "$s" --content "$new_content" >/dev/null
     fi
-  fi
+    mkdir -p "$cfg_path/snippets"
+    SNIPPET_STORAGE="$s"
+    return
+  done < <(pvesm status 2>/dev/null | awk 'NR>1 {print $1}')
 
-  die "Kein Proxmox-Storage mit 'snippets' gefunden. Bitte auf einem Directory-Storage 'snippets' aktivieren."
+  die "Kein Proxmox-Directory-Storage gefunden. Bitte 'snippets' auf einem Directory-Storage aktivieren."
 }
 
 next_vmid() {
@@ -170,10 +176,10 @@ create_cloud_init() {
   local snippet_dir="/var/lib/vz/snippets"
 
   if [[ "$SNIPPET_STORAGE" == "local" ]]; then
-    snippet_dir="$(pvesm config local | awk -F': ' '$1=="path"{print $2}')/snippets"
+    snippet_dir="$(pvesm_cfg local path)/snippets"
   else
     local cfg_path
-    cfg_path="$(pvesm config "$SNIPPET_STORAGE" | awk -F': ' '$1=="path"{print $2}')"
+    cfg_path="$(pvesm_cfg "$SNIPPET_STORAGE" path)"
     [[ -n "$cfg_path" ]] || die "Snippet-Storage '$SNIPPET_STORAGE' hat keinen Directory-Pfad."
     snippet_dir="$cfg_path/snippets"
   fi
