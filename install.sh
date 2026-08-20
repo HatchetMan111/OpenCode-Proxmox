@@ -166,21 +166,33 @@ download_image() {
   mkdir -p "$dir"
   IMAGE_PATH="$dir/$UBUNTU_IMAGE"
 
-  if [[ ! -s "$IMAGE_PATH" ]]; then
-    info "Lade offizielles Ubuntu 24.04 LTS Cloud Image herunter ..."
-    curl -fL --progress-bar -o "$IMAGE_PATH" "$UBUNTU_BASE/$UBUNTU_IMAGE"
-  else
+  # Verify the image against Ubuntu's published SHA256. Prints nothing and
+  # returns non-zero when the hash does not match.
+  verify_image() {
+    local sums expected
+    sums="$(mktemp)"
+    curl -fsSL -o "$sums" "$UBUNTU_BASE/SHA256SUMS"
+    expected="$(awk -v f="$UBUNTU_IMAGE" '{sub(/^\*/, "", $2)} $2=="./"f || $2==f {print $1; exit}' "$sums")"
+    rm -f "$sums"
+
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "SHA256 des Ubuntu Images konnte nicht aus SHA256SUMS gelesen werden."
+    printf '%s  %s\n' "$expected" "$IMAGE_PATH" | sha256sum -c - >/dev/null
+  }
+
+  if [[ -s "$IMAGE_PATH" ]]; then
     info "Ubuntu Cloud Image ist bereits vorhanden."
+    if verify_image; then
+      ok "Ubuntu 24.04 LTS Cloud Image verifiziert."
+      return
+    fi
+    warn "Vorhandenes Ubuntu Image ist beschädigt. Lade es erneut herunter ..."
+    rm -f "$IMAGE_PATH"
   fi
 
-  local sums expected
-  sums="$(mktemp)"
-  curl -fsSL -o "$sums" "$UBUNTU_BASE/SHA256SUMS"
-  expected="$(awk -v f="$UBUNTU_IMAGE" '{sub(/^\*/, "", $2)} $2=="./"f || $2==f {print $1; exit}' "$sums")"
-  rm -f "$sums"
+  info "Lade offizielles Ubuntu 24.04 LTS Cloud Image herunter ..."
+  curl -fL --progress-bar -o "$IMAGE_PATH" "$UBUNTU_BASE/$UBUNTU_IMAGE"
 
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "SHA256 des Ubuntu Images konnte nicht aus SHA256SUMS gelesen werden."
-  printf '%s  %s\n' "$expected" "$IMAGE_PATH" | sha256sum -c - >/dev/null || die "Ubuntu Cloud Image SHA256-Prüfung fehlgeschlagen."
+  verify_image || die "Ubuntu Cloud Image SHA256-Prüfung fehlgeschlagen."
   ok "Ubuntu 24.04 LTS Cloud Image verifiziert."
 }
 
