@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_VERSION="24.04"
@@ -247,6 +247,7 @@ write_files:
     owner: root:root
     permissions: '0755'
     content: |
+      # BEGIN_OPENCODE_SETUP
       #!/usr/bin/env bash
       set -Eeuo pipefail
       trap 'echo "FEHLER in Zeile \$LINENO: \$BASH_COMMAND" >&2' ERR
@@ -355,6 +356,7 @@ write_files:
       chmod 0644 /var/lib/opencode/installed-at
 
       echo "=== opencode-setup abgeschlossen: \$(date -Is) ==="
+      # END_OPENCODE_SETUP
 
 runcmd:
   - [bash, -lc, "/usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1"]
@@ -512,10 +514,48 @@ vm_setup_log_exists() {
   [[ "$rc" == "0" ]]
 }
 
+# Deliver opencode-setup and /etc/opencode/server.env into the VM directly via
+# the QEMU guest agent (base64). This is the reliable provisioning path: some
+# environments never apply a `cicustom` user-data snippet, so we must not
+# depend on cloud-init write_files for the essential files.
+provision_files_via_agent() {
+  local rc script_b64 env_b64
+
+  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  [[ "$rc" == "0" ]] && return 0
+
+  info "Übergebe opencode-setup und server.env direkt in die VM (Guest-Agent) ..."
+  script_b64="$(sed -n '/# BEGIN_OPENCODE_SETUP/,/# END_OPENCODE_SETUP/p' "$SNIPPET_PATH" | sed '1d;$d' | sed 's/^      //' | base64 -w0 2>/dev/null)"
+  env_b64="$(printf 'OPENCODE_SERVER_USERNAME=opencode\nOPENCODE_SERVER_PASSWORD=%s' "$SERVER_PASSWORD" | base64 -w0)"
+
+  if [[ -z "$script_b64" || -z "$env_b64" ]]; then
+    warn "Konnte Setup-Inhalt nicht kodieren."
+    return 1
+  fi
+
+  qm guest exec "$VMID" -- bash -c "echo $script_b64 | base64 -d > /usr/local/sbin/opencode-setup && chmod 0755 /usr/local/sbin/opencode-setup" >/dev/null 2>&1 || true
+  qm guest exec "$VMID" -- bash -c "install -d -m 0700 /etc/opencode && echo $env_b64 | base64 -d > /etc/opencode/server.env && chmod 0600 /etc/opencode/server.env" >/dev/null 2>&1 || true
+
+  rc="$(qm guest exec "$VMID" --timeout 5 -- test -f /usr/local/sbin/opencode-setup 2>/dev/null | jq -r '.returncode // 1' 2>/dev/null || true)"
+  if [[ "$rc" == "0" ]]; then
+    ok "Dateien in die VM geschrieben."
+    return 0
+  fi
+  warn "Schreiben der Dateien in die VM fehlgeschlagen (Guest-Agent-Exec nicht verfügbar?)."
+  return 1
+}
+
 wait_for_setup() {
   local i status fallback_sent=no pid exited exitcode
 
   info "Warte bis opencode-setup in der VM abgeschlossen ist (bis zu 15 Min) ..."
+
+  # Make sure the provisioning files exist in the VM first. If cloud-init
+  # never applied our user-data snippet, push them via the guest agent.
+  if ! vm_setup_done && ! provision_files_via_agent; then
+    warn "Provisionierung der Dateien in die VM fehlgeschlagen."
+    return 1
+  fi
 
   for i in {1..180}; do
     if vm_setup_done; then
