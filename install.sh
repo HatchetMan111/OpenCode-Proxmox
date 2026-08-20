@@ -395,6 +395,29 @@ get_ip() {
     head -n1 || true
 }
 
+# Run a command inside the VM via the QEMU guest agent and print its decoded
+# stdout/stderr. Silent when the agent is not available.
+exec_guest() {
+  local raw out err
+  raw="$(qm guest exec "$VMID" --timeout 10 -- "$@" 2>/dev/null || true)"
+  out="$(printf '%s' "$raw" | jq -r '.out-data // empty' 2>/dev/null | base64 -d 2>/dev/null)"
+  err="$(printf '%s' "$raw" | jq -r '.err-data // empty' 2>/dev/null | base64 -d 2>/dev/null)"
+  printf '%s%s' "$out" "$err"
+}
+
+# Pull the first useful diagnostic triage from the guest and show it.
+vm_triage() {
+  info "Sammle automatische Diagnose aus der VM ..."
+  echo
+  echo "----- /var/log/opencode-setup.log (Ende) -----"
+  exec_guest cat /var/log/opencode-setup.log 2>/dev/null | tail -n 30
+  echo "----- opencode.service: is-active ----"
+  echo "Status: $(exec_guest systemctl is-active opencode 2>/dev/null)"
+  echo "----- opencode.service: journal (Ende) -----"
+  exec_guest journalctl -u opencode -n 25 --no-pager 2>/dev/null
+  echo "----- Ende Diagnose -----"
+}
+
 wait_for_ip() {
   info "Starte VM und warte auf QEMU Guest Agent ..."
 
@@ -435,11 +458,16 @@ wait_for_service() {
     warn "Der Port ${OPENCODE_PORT} ist (noch) nicht erreichbar."
     warn "Die Ersteinrichtung dauert nach dem Boot einige Minuten."
   fi
-  warn "Prüfe in der VM (qm terminal ${VMID}):"
-  warn "  systemctl status opencode"
-  warn "  journalctl -u opencode -e"
-  warn "  cat /var/log/opencode-setup.log"
-  warn "  ip a"
+
+  vm_triage
+
+  warn "Falls die Diagnose leer bleibt, läuft cloud-init in der VM noch und der"
+  warn "Guest-Agent antwortet noch nicht. Prüfe dann von Hand:"
+  warn "  qm terminal ${VMID}"
+  warn "    systemctl status opencode"
+  warn "    journalctl -u opencode -e"
+  warn "    cat /var/log/opencode-setup.log"
+  warn "    ip a"
 }
 
 print_result() {
@@ -449,15 +477,16 @@ print_result() {
                  OpenCode ist bereit
 ============================================================
 
-  Web UI:
-    http://${VM_IP}:${OPENCODE_PORT}
+  🌐  Web-UI im Browser öffnen:
 
-  Benutzer:
-    opencode
+       http://${VM_IP}:${OPENCODE_PORT}
 
-  Web-Passwort:
-    ${SERVER_PASSWORD}
+  📋  Login (beim ersten Screen der Web-UI):
 
+       Benutzer:      opencode
+       Web-Passwort:  ${SERVER_PASSWORD}
+
+------------------------------------------------------------
   VM:
     ${VMID} (${VM_NAME})
 
@@ -480,7 +509,7 @@ print_result() {
     journalctl -u opencode -f
 
   Modellanbieter:
-    Öffne die Web UI und nutze /connect.
+    Öffne die Web-UI und nutze /connect.
     OpenCode unterstützt 75+ Anbieter und auch lokale Modelle.
     API-/OAuth-Zugangsdaten werden von OpenCode in der VM gespeichert.
 
