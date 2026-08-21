@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
@@ -34,12 +34,12 @@ IMAGE_PATH=""
 SNIPPET_STORAGE=""
 SNIPPET_PATH=""
 VM_IP=""
-KEEP_SNIPPET="no"
 
-cleanup() {
-  [[ -n "${SNIPPET_PATH:-}" && "${KEEP_SNIPPET:-no}" != "yes" ]] && rm -f "$SNIPPET_PATH" 2>/dev/null || true
-}
-trap cleanup EXIT
+# Hinweis: Das Cloud-Init-Snippet wird absichtlich DAUERHAFT behalten.
+# Die VM-Konfiguration referenziert es ueber cicustom
+# ("user=local:snippets/opencode-<VMID>.yaml"). Wuerde man es beim
+# Script-Ende loeschen, startet die VM beim naechsten Reboot nicht mehr mit
+# dem Fehler: volume 'local:snippets/opencode-<VMID>.yaml' does not exist.
 
 info() { printf '\033[1;36m[INFO]\033[0m %s\n' "$*"; }
 ok() { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -351,7 +351,7 @@ write_files:
       export DEBIAN_FRONTEND=noninteractive
       echo "[1/7] Installiere Abhaengigkeiten ..."
       apt-get update
-      apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent
+      apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent iproute2
 
       USER="opencode"
       HOME_DIR="/home/opencode"
@@ -361,6 +361,8 @@ write_files:
       echo "[2/7] Erstelle Verzeichnisse und Konfiguration ..."
       install -d -o "\$USER" -g "\$USER" "\$PROJECTS"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config"
+      install -d -o "\$USER" -g "\$USER" -m 0700 "\$HOME_DIR/.local"
+      install -d -o "\$USER" -g "\$USER" -m 0700 "\$HOME_DIR/.local/state"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.local/share"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config/opencode"
 
@@ -437,12 +439,22 @@ write_files:
       ufw --force enable
 
       echo "[6/7] Bereite Verzeichnisse vor ..."
-      chown -R opencode:opencode "\$PROJECTS" "\$HOME_DIR/.config" "\$HOME_DIR/.local/share"
+      chown -R "\$USER:\$USER" "\$HOME_DIR"
 
       echo "[7/7] Starte Dienste ..."
       systemctl daemon-reload
       systemctl enable --now qemu-guest-agent.service
-      systemctl enable --now opencode.service
+      systemctl enable opencode.service
+      # Port-Check: Falls bereits eine (alte) Instanz auf dem Port lauscht,
+      # neu starten statt starten - sonst stirbt der Dienst mit ServeError,
+      # weil der Port schon belegt ist. systemd ist die EINZIGE Instanz, die
+      # OpenCode verwaltet - nie manuell "opencode web ..." ausfuehren.
+      if ss -lntp 2>/dev/null | grep -q ":${OPENCODE_PORT} "; then
+        echo "Port ${OPENCODE_PORT} ist bereits belegt - starte opencode.service neu."
+        systemctl restart opencode.service
+      else
+        systemctl start opencode.service
+      fi
 
       # Store a non-secret readiness marker.
       install -d -m 0755 /var/lib/opencode

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.9.0
+
+- **Fix (Ursache des `volume 'local:snippets/opencode-<VMID>.yaml' does not
+  exist`-Startfehlers):** Das Cloud-Init-Snippet wird nicht mehr beim
+  Script-Ende gelöscht. Die VM-Konfiguration referenziert es dauerhaft über
+  `cicustom` — der komplette `cleanup()`-Exit-Trap (samt `KEEP_SNIPPET`) ist
+  entfernt. Das Snippet bleibt absichtlich dauerhaft auf dem Proxmox-Host.
+- **Fix (`EACCES: permission denied, mkdir '/home/opencode/.local/state'`):**
+  `/home/opencode/.local` und `/home/opencode/.local/state` werden jetzt im
+  Setup-Script explizit mit `install -d -o opencode -g opencode -m 0700`
+  angelegt, danach zusätzlich `chown -R opencode:opencode /home/opencode`.
+- **Port-Konflikt verhindert (ServeError):** Vor dem Start von
+  `opencode.service` prüft das Setup-Script per `ss`, ob Port 4096 bereits
+  belegt ist, und startet den Dienst dann neu statt erneut zu starten.
+  systemd ist damit die einzige Instanz, die OpenCode verwaltet — ein
+  manueller `opencode web ...`-Aufruf ist nicht mehr nötig und führt sonst
+  nur zum doppelten Port-Bindung-Fehler (`ServeError`).
+- `iproute2` explizit in der VM installiert (für den `ss`-Port-Check).
+
 ## 1.8.0
 
 - **Fix (Ursache des "hängt bei Warte auf SSH"-Fehlers):** `--cicustom "user=<snippet>"`
