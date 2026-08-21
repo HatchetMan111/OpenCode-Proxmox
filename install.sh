@@ -11,10 +11,9 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly HOSTNAME_DEFAULT="opencode"
-readonly UBUNTU_VERSION="24.04"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
 readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
 readonly OPENCODE_PORT="4096"
@@ -200,6 +199,25 @@ ssh_setup_running() {
   sshe "pgrep -f /usr/local/sbin/opencode-setup >/dev/null" >/dev/null 2>&1
 }
 
+# --- Guest-Agent-Diagnose (funktioniert schon, bevor/falls SSH nie klappt) ---
+# Der QEMU Guest Agent laeuft schon vor jeglichem SSH-Zugriff (wir nutzen ihn
+# bereits in get_ip). Darueber koennen wir Diagnosebefehle in der VM
+# ausfuehren, ganz ohne SSH-Login - das ist unsere Rueckfallebene, damit die
+# Ausgabe auch dann etwas Nuetzliches zeigt, wenn SSH (noch) nicht geht.
+
+guest_agent_ready() {
+  qm agent "$VMID" ping >/dev/null 2>&1
+}
+
+# Fuehrt einen Shell-Befehl per Guest-Agent in der VM aus und gibt nur die
+# Standardausgabe zurueck. Liefert nichts bei Fehler/Timeout.
+gexec_out() {
+  local timeout="$1"
+  shift
+  qm guest exec "$VMID" --timeout "$timeout" -- bash -lc "$*" 2>/dev/null |
+    jq -r '.["out-data"] // empty' 2>/dev/null
+}
+
 download_image() {
   local dir="/var/lib/vz/template/iso"
   mkdir -p "$dir"
@@ -244,13 +262,47 @@ create_cloud_init() {
   mkdir -p "$snippet_dir"
   SNIPPET_PATH="$snippet_dir/opencode-${VMID}.yaml"
 
+  local pubkey_content
+  pubkey_content="$(cat "$SSH_PUBKEY" 2>/dev/null || true)"
+  [[ -n "$pubkey_content" ]] || die "SSH-Public-Key '$SSH_PUBKEY' ist leer oder fehlt."
+
   # Credentials are generated per installation and written only to the VM's
   # cloud-init seed. They are never stored in the Git repository.
+  #
+  # WICHTIG (root cause of the historical "haengt bei Warte auf SSH"-Bugs):
+  # Sobald --cicustom "user=<snippet>" gesetzt ist, ersetzt Proxmox das
+  # KOMPLETTE automatisch generierte user-data 1:1 durch dieses Snippet.
+  # --ciuser, --cipassword und --sshkeys (siehe create_vm/qm set) werden
+  # dabei STILLSCHWEIGEND ignoriert - bestaetigtes, dokumentiertes
+  # Proxmox-Verhalten (siehe forum.proxmox.com, Threads 78070, 154766,
+  # 170295 u.a.: "Using a custom user snippet overrides the complete user
+  # config set via qm set. If you set ciuser/cipassword/sshkeys in the CLI
+  # AND add a custom user snippet, only the options in the snippet count.").
+  # Der SSH-Key und das Passwort muessen deshalb HIER im Snippet selbst
+  # gesetzt werden - sonst bekommt root nie einen Login und jeder SSH-Warte-
+  # loop laeuft garantiert in den Timeout, egal wie lange man wartet.
+  # Zusaetzlich muss disable_root: false gesetzt werden, weil Ubuntu-Cloud-
+  # Images sonst jedem Root-Login per Key ein "Please login as ubuntu..."-
+  # Forced-Command unterschieben und die Verbindung sofort wieder trennen.
   cat >"$SNIPPET_PATH" <<EOF
 #cloud-config
 
 hostname: opencode
 manage_etc_hosts: true
+
+users:
+  - name: root
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${pubkey_content}
+
+ssh_pwauth: true
+disable_root: false
+
+chpasswd:
+  expire: false
+  list: |
+    root:${CI_PASSWORD}
 
 package_update: true
 package_upgrade: false
@@ -443,10 +495,10 @@ create_vm() {
   qm set "$VMID" --efidisk0 "$STORAGE:0,efitype=4m" >/dev/null
   qm set "$VMID" --ide2 "$STORAGE:cloudinit" >/dev/null
 
+  # Kein --ciuser/--cipassword/--sshkeys hier: die sind durch --cicustom
+  # "user=..." unten sowieso wirkungslos (siehe Kommentar in
+  # create_cloud_init). Root-Zugang kommt komplett aus dem Snippet.
   qm set "$VMID" \
-    --ciuser root \
-    --cipassword "$CI_PASSWORD" \
-    --sshkeys "$SSH_PUBKEY" \
     --ipconfig0 ip=dhcp \
     --nameserver "1.1.1.1 9.9.9.9" \
     --cicustom "user=${SNIPPET_STORAGE}:snippets/$(basename "$SNIPPET_PATH")" \
@@ -470,23 +522,51 @@ get_ip() {
     head -n1 || true
 }
 
-# Pull the decisive diagnostics from the VM over SSH (guest exec is
-# unreliable on this node) and show them.
+# Sammelt Diagnosedaten aus der VM. Nutzt in erster Linie den QEMU
+# Guest-Agent (der laeuft schon lange bevor SSH je klappen wuerde), SSH nur
+# ergaenzend falls es bereits erreichbar ist. So zeigt die Ausgabe auch dann
+# etwas Brauchbares, wenn SSH komplett hangt.
 vm_triage() {
-  local l="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@${VM_IP}"
   echo
-  info "Sammle Diagnose aus der VM (SSH) ..."
-  echo "----- Wurde unsere Cloud-Init-Konfiguration angewendet? -----"
-  $l "test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null && echo user-data vorhanden || echo user-data FEHLT" 2>/dev/null || echo "SSH nicht erreichbar"
-  $l "test -f /usr/local/sbin/opencode-setup 2>/dev/null && echo setup-script vorhanden || echo setup-script FEHLT" 2>/dev/null || true
-  $l "test -f /etc/opencode/server.env 2>/dev/null && echo server.env vorhanden || echo server.env FEHLT" 2>/dev/null || true
-  echo
-  echo "----- /var/log/opencode-setup.log (Ende) -----"
-  $l "tail -n 30 /var/log/opencode-setup.log 2>/dev/null || echo '<kein Setup-Log>'" 2>/dev/null
-  echo "----- opencode.service: is-active ----"
-  $l "systemctl is-active opencode 2>/dev/null || echo '<inaktiv>'" 2>/dev/null
-  echo "----- opencode.service: journal (Ende) -----"
-  $l "journalctl -u opencode -n 25 --no-pager 2>/dev/null || echo '<kein Journal>'" 2>/dev/null
+  info "Sammle Diagnose aus der VM ..."
+
+  if guest_agent_ready; then
+    echo "----- Guest-Agent-Diagnose (ohne SSH) -----"
+
+    echo "cloud-init Status:"
+    gexec_out 10 "cloud-init status --long 2>&1 || echo '<cloud-init-Status nicht abrufbar>'"
+
+    echo
+    echo "Root-SSH-Zugang vorbereitet? (das war die Ursache frueherer Haenger)"
+    gexec_out 5 "test -s /root/.ssh/authorized_keys && printf 'authorized_keys vorhanden (%s Zeile/n)\n' \"\$(wc -l < /root/.ssh/authorized_keys)\" || echo 'authorized_keys FEHLT -> SSH-Key kam nicht in der VM an'"
+
+    echo
+    echo "opencode-setup / server.env vorhanden?"
+    gexec_out 5 "test -x /usr/local/sbin/opencode-setup && echo 'setup-script vorhanden' || echo 'setup-script FEHLT'"
+    gexec_out 5 "test -f /etc/opencode/server.env && echo 'server.env vorhanden' || echo 'server.env FEHLT'"
+
+    echo
+    echo "/var/log/opencode-setup.log (Ende):"
+    gexec_out 5 "tail -n 30 /var/log/opencode-setup.log 2>/dev/null || echo '<kein Setup-Log>'"
+
+    echo
+    echo "opencode.service:"
+    gexec_out 5 "systemctl is-active opencode 2>/dev/null || echo '<inaktiv>'"
+    gexec_out 6 "journalctl -u opencode -n 20 --no-pager 2>/dev/null || echo '<kein Journal>'"
+
+    echo
+    echo "/var/log/cloud-init.log (Ende, evtl. Fehlerursache):"
+    gexec_out 8 "tail -n 20 /var/log/cloud-init.log 2>/dev/null || echo '<kein cloud-init.log>'"
+  else
+    warn "Guest-Agent antwortet gerade nicht - VM bootet evtl. noch."
+  fi
+
+  if ssh_ready; then
+    echo
+    echo "----- Zusaetzliche SSH-Diagnose -----"
+    sshe "test -s /var/lib/cloud/instance/user-data.txt 2>/dev/null && echo user-data vorhanden || echo user-data FEHLT" 2>/dev/null || true
+  fi
+
   echo "----- Ende Diagnose -----"
 }
 
@@ -537,7 +617,11 @@ wait_for_setup() {
       break
     fi
     if (( i % 6 == 0 )); then
-      info "Warte auf SSH ... (${i}/36)"
+      local ci_status=""
+      if guest_agent_ready; then
+        ci_status="$(gexec_out 5 "cloud-init status 2>&1")"
+      fi
+      info "Warte auf SSH ... (${i}/36)${ci_status:+ — cloud-init: ${ci_status}}"
     fi
     sleep 5
   done
@@ -546,6 +630,7 @@ wait_for_setup() {
       warn "SSH-Port 22 an ${VM_IP} ist NICHT erreichbar (Netzwerk/Firewall?)."
     else
       warn "SSH-Port 22 ist offen, aber Root-Login mit dem Key schlägt fehl."
+      warn "(Frueher meist: authorized_keys fehlt in der VM - siehe Diagnose unten.)"
     fi
     warn "Kein SSH-Zugang zu ${VM_IP}."
     return 1
@@ -613,13 +698,10 @@ wait_for_service() {
       fi
     fi
     if (( i % 30 == 0 )); then
-      local snippet rc
-      if sshe "test -f /var/log/opencode-setup.log" >/dev/null 2>&1; then
-        snippet="Setup gestartet"
-      else
-        snippet="opencode-setup läuft noch (setup-log fehlt)"
-      fi
-      info "Warte weiter ... (${i}/300) ${snippet}"
+      local snippet
+      snippet="$(gexec_out 5 "tail -n 1 /var/log/opencode-setup.log 2>/dev/null")"
+      [[ -n "$snippet" ]] || snippet="opencode-setup-Log noch leer/nicht vorhanden"
+      info "Warte weiter ... (${i}/300) — ${snippet}"
     fi
     sleep 2
   done
@@ -721,10 +803,29 @@ print_result() {
 EOF
 }
 
+# Rein informativ: weist auf VMs mit dem Tag "opencode" aus frueheren
+# (evtl. fehlgeschlagenen) Laeufen hin. Wird NICHTS geloescht oder
+# automatisch angefasst - jeder Lauf legt bewusst eine frische VM an, damit
+# nie versehentlich eine noch benutzte Installation angetastet wird.
+list_existing_opencode_vms() {
+  local id name status found=0
+  while read -r id name status; do
+    [[ -n "$id" ]] || continue
+    if qm config "$id" 2>/dev/null | grep -q '^tags:.*opencode'; then
+      warn "Vorhandene VM ${id} (${name}, Status: ${status}) traegt bereits den Tag 'opencode' - evtl. Rest eines frueheren Versuchs."
+      warn "  Aufraeumen falls nicht mehr gebraucht: qm stop ${id}; qm destroy ${id} --purge"
+      found=1
+    fi
+  done < <(qm list 2>/dev/null | awk 'NR>1 {print $1, $2, $3}')
+  [[ "$found" -eq 1 ]] && echo
+  return 0
+}
+
 main() {
   info "${APP_NAME}-Proxmox Installer v${SCRIPT_VERSION}"
   require_root
   install_dependencies
+  list_existing_opencode_vms
   choose_storage
   choose_snippet_storage
   next_vmid
