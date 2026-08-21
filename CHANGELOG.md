@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.9.1
+
+- **SSH ist jetzt optional statt Pflicht (wichtigste Änderung):**
+  `wait_for_setup()` prüft den Fertig-Marker (`/var/lib/opencode/installed-at`)
+  primär über den QEMU Guest-Agent (`qm guest exec`) — komplett ohne SSH.
+  Ein SSH-Fehlschlag führt nie mehr zum Abbruch; vorher brach die Installation
+  ab, wenn SSH nach 3 Minuten nicht erreichbar war, obwohl cloud-init das
+  Setup längst erfolgreich ausgeführt hätte. SSH wird nur noch einmalig als
+  optionaler Fallback versucht, um fehlende Dateien zu übergeben bzw. das
+  Setup zu beschleunigen. Architektur damit konsequent:
+  Guest-Agent → cloud-init → systemd → OpenCode.
+- **Port-4096-Konflikt sauber aufgelöst:** Belegt ein Fremdprozess den Port
+  (z.B. manuell gestartetes `opencode web`), wird er jetzt per
+  `fuser -k 4096/tcp` beendet, bevor `opencode.service` startet. Ein reines
+  `systemctl restart` hätte einen Nicht-systemd-Prozess unberührt gelassen
+  und der Dienst wäre trotzdem im ServeError-Loop geblieben.
+- `get_ip()` filtert jetzt auch Link-Local-Adressen (`169.254.x.x`), damit
+  bei hängendem DHCP nicht eine nutzlose APIPA-Adresse als VM-IP gemeldet
+  wird.
+- `psmisc` explizit in der VM installiert (für `fuser`).
+- Ungenutzte Variablen `HOSTNAME`/`HOSTNAME_DEFAULT` entfernt.
+
 ## 1.9.0
 
 - **Fix (Ursache des `volume 'local:snippets/opencode-<VMID>.yaml' does not
@@ -40,9 +62,6 @@
   aus früheren Versuchen samt Aufräum-Befehl, damit keine verwaisten VMs
   unbemerkt liegen bleiben.
 - Entfernt ungenutzte Konstante `UBUNTU_VERSION` (shellcheck SC2034).
-
-## Unreleased
-
 - Initial GitHub-ready release.
 - Ubuntu 24.04 LTS Cloud Image based VM installation.
 - SHA256 verification against Ubuntu's published checksums.

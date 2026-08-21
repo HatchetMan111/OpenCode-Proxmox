@@ -11,9 +11,8 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.9.1"
 readonly VM_NAME_DEFAULT="opencode"
-readonly HOSTNAME_DEFAULT="opencode"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
 readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
 readonly OPENCODE_PORT="4096"
@@ -22,7 +21,6 @@ VMID=""
 SSH_KEY="/root/.ssh/id_ed25519"
 SSH_PUBKEY="${SSH_KEY}.pub"
 VM_NAME="${VM_NAME_DEFAULT}"
-HOSTNAME="${HOSTNAME_DEFAULT}"
 STORAGE=""
 BRIDGE="vmbr0"
 DISK="32G"
@@ -199,6 +197,26 @@ ssh_setup_running() {
   sshe "pgrep -f /usr/local/sbin/opencode-setup >/dev/null" >/dev/null 2>&1
 }
 
+# --- Marker-Checks über den QEMU Guest-Agent (ohne SSH) ---
+# Der QEMU Guest Agent ist die PRIMÄRE Steuerungsebene: Er antwortet lange
+# bevor SSH läuft und funktioniert auch, wenn SSH (z.B. durch Firewall oder
+# fehlgeschlagenen Key-Import) nie erreichbar ist. SSH ist nur noch ein
+# optionaler Fallback zur Beschleunigung.
+
+# Liefert true, wenn opencode-setup in der VM fertig ist (Marker existiert).
+# jq -s (slurp) ist wichtig: Bei leerer Ausgabe (Guest-Agent tot/boote noch)
+# liefert plain "jq -e" fälschlich Exit 0 - mit -s wird [] zu false.
+ga_has_marker() {
+  qm guest exec "$VMID" --timeout 5 -- test -f /var/lib/opencode/installed-at 2>/dev/null |
+    jq -se '.[0].exitcode == 0' >/dev/null 2>&1
+}
+
+# Liefert true, wenn opencode-setup gerade in der VM läuft.
+ga_setup_running() {
+  qm guest exec "$VMID" --timeout 5 -- pgrep -f /usr/local/sbin/opencode-setup 2>/dev/null |
+    jq -se '.[0].exitcode == 0' >/dev/null 2>&1
+}
+
 # --- Guest-Agent-Diagnose (funktioniert schon, bevor/falls SSH nie klappt) ---
 # Der QEMU Guest Agent laeuft schon vor jeglichem SSH-Zugriff (wir nutzen ihn
 # bereits in get_ip). Darueber koennen wir Diagnosebefehle in der VM
@@ -351,7 +369,7 @@ write_files:
       export DEBIAN_FRONTEND=noninteractive
       echo "[1/7] Installiere Abhaengigkeiten ..."
       apt-get update
-      apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent iproute2
+      apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent iproute2 psmisc
 
       USER="opencode"
       HOME_DIR="/home/opencode"
@@ -450,7 +468,13 @@ write_files:
       # weil der Port schon belegt ist. systemd ist die EINZIGE Instanz, die
       # OpenCode verwaltet - nie manuell "opencode web ..." ausfuehren.
       if ss -lntp 2>/dev/null | grep -q ":${OPENCODE_PORT} "; then
-        echo "Port ${OPENCODE_PORT} ist bereits belegt - starte opencode.service neu."
+        echo "Port ${OPENCODE_PORT} ist belegt - beende fremde Prozesse (z.B. manuell gestartetes 'opencode web') ..."
+        # fuser -k beendet ALLE Prozesse auf dem Port, auch solche, die
+        # nicht zu opencode.service gehoeren. Nur so kann systemd danach
+        # sauber binden - ein einfaches 'restart' wuerde einen Fremdprozess
+        # unberuehrt lassen und der Dienst stuende im ServeError-Loop.
+        fuser -k "${OPENCODE_PORT}/tcp" 2>/dev/null || true
+        sleep 1
         systemctl restart opencode.service
       else
         systemctl start opencode.service
@@ -530,7 +554,7 @@ get_ip() {
       | select(.["ip-address-type"]=="ipv4")
       | .["ip-address"]
     ' 2>/dev/null |
-    grep -v '^127\.' |
+    grep -v -e '^127\.' -e '^169\.254\.' |
     head -n1 || true
 }
 
@@ -615,42 +639,14 @@ wait_for_ip() {
   die "Keine IPv4-Adresse über den QEMU Guest Agent erhalten. Prüfe die VM-Konsole."
 }
 
-# Wait for opencode-setup to finish inside the VM, driving it over SSH.
-wait_for_setup() {
-  local i
-
-  info "Warte bis opencode-setup in der VM abgeschlossen ist (bis zu 15 Min) ..."
-
-  # 0) Wait until the VM accepts SSH as root (cloud-init injected our key).
-  info "Warte auf SSH-Zugang zur VM (root@${VM_IP}) ..."
-  for i in {1..36}; do
-    if ssh_ready; then
-      ok "SSH-Zugang verfügbar."
-      break
-    fi
-    if (( i % 6 == 0 )); then
-      local ci_status=""
-      if guest_agent_ready; then
-        ci_status="$(gexec_out 5 "cloud-init status 2>&1")"
-      fi
-      info "Warte auf SSH ... (${i}/36)${ci_status:+ — cloud-init: ${ci_status}}"
-    fi
-    sleep 5
-  done
-  if ! ssh_ready; then
-    if timeout 3 bash -c "</dev/tcp/${VM_IP}/22" >/dev/null 2>&1; then
-      warn "SSH-Port 22 an ${VM_IP} ist NICHT erreichbar (Netzwerk/Firewall?)."
-    else
-      warn "SSH-Port 22 ist offen, aber Root-Login mit dem Key schlägt fehl."
-      warn "(Frueher meist: authorized_keys fehlt in der VM - siehe Diagnose unten.)"
-    fi
-    warn "Kein SSH-Zugang zu ${VM_IP}."
-    return 1
-  fi
-
-  # 1) Push the provisioning files if they are missing.
-  if ! sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1; then
-    info "Übergebe opencode-setup und server.env per SSH in die VM ..."
+# Optionaler SSH-Fallback: Uebergibt opencode-setup und server.env per SSH,
+# falls cloud-init die Dateien (noch) nicht angelegt hat, und startet das
+# Setup - aber NUR wenn es nicht bereits laeuft oder fertig ist. Schlägt
+# irgendetwas fehl, ist das unkritisch: cloud-init's runcmd erledigt dieselben
+# Schritte sowieso selbstständig. Diese Funktion ist reine Beschleunigung.
+ssh_push_setup() {
+  sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1 || {
+    info "Übergebe opencode-setup und server.env optional per SSH in die VM ..."
     sed -n '/# BEGIN_OPENCODE_SETUP/,/# END_OPENCODE_SETUP/p' "$SNIPPET_PATH" | \
       sed '1d;$d' | sed 's/^      //' |
       ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -660,33 +656,69 @@ wait_for_setup() {
       ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 "root@${VM_IP}" \
         'install -d -m 0700 /etc/opencode && cat > /etc/opencode/server.env && chmod 0600 /etc/opencode/server.env' 2>/dev/null || true
-  fi
-  if ! sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1; then
-    warn "Übertragen der Dateien per SSH fehlgeschlagen."
-    return 1
-  fi
-  ok "opencode-setup und server.env sind in der VM."
+    sshe "test -x /usr/local/sbin/opencode-setup" >/dev/null 2>&1 || return 1
+  }
+  ok "opencode-setup und server.env sind in der VM (per SSH verifiziert)."
 
-  # 2) Start the setup only if it has not run yet (marker check) and is not
-  #    already being driven by cloud-init's runcmd.
-  if ! ssh_has_marker && ! ssh_setup_running; then
-    info "Starte opencode-setup in der VM (per SSH) ..."
+  if ! ssh_has_marker && ! ssh_setup_running && ! ga_setup_running; then
+    info "Starte opencode-setup optional per SSH ..."
     sshe "nohup /usr/local/sbin/opencode-setup > /var/log/opencode-setup.log 2>&1 < /dev/null &" >/dev/null 2>&1 || true
   fi
+  return 0
+}
 
-  # 3) Wait for the marker.
-  for i in {1..120}; do
-    if ssh_has_marker; then
-      ok "opencode-setup abgeschlossen (Marker gefunden)."
+# Wartet bis opencode-setup in der VM fertig ist. PRIMÄR über den QEMU
+# Guest-Agent (Marker-Datei prüfen) - funktioniert komplett ohne SSH.
+# SSH wird nur einmalig als optionaler Fallback versucht, falls der
+# Guest-Agent den Marker liefert UND SSH zufällig erreichbar ist. Ein
+# SSH-Fehlschlag führt NIEMALS zum Abbruch der Installation.
+wait_for_setup() {
+  local i ssh_tried=0 ci_status=""
+
+  info "Warte bis opencode-setup in der VM abgeschlossen ist (bis zu 15 Min) ..."
+  info "Prüfung läuft primär über den QEMU Guest-Agent - SSH ist nur optional."
+
+  for i in {1..180}; do
+    # 1) Fertig? (Guest-Agent zuerst, SSH nur ergänzend)
+    if ga_has_marker; then
+      ok "opencode-setup abgeschlossen (Marker via Guest-Agent gefunden)."
       return 0
     fi
+    if (( ssh_tried == 1 )) && ssh_has_marker; then
+      ok "opencode-setup abgeschlossen (Marker via SSH gefunden)."
+      return 0
+    fi
+
+    # 2) Optionaler SSH-Fallback: wird versucht, sobald der Guest-Agent
+    #    oben ist aber den Marker noch nicht liefern kann - oder (FALLBACK
+    #    DES FALLBACKS) alle 2 Minuten, wenn der Guest-Agent gar nicht
+    #    hochkommt, denn dann ist SSH die einzige Chance.
+    if (( ssh_tried == 0 )); then
+      try_ssh=0
+      if guest_agent_ready && ! ga_setup_running; then
+        try_ssh=1
+      elif (( i % 24 == 0 )); then
+        try_ssh=1
+        if (( i == 24 )); then
+          warn "Guest-Agent liefert bisher nichts - versuche periodisch den optionalen SSH-Fallback."
+        fi
+      fi
+      if (( try_ssh == 1 )) && ssh_ready; then
+        ssh_tried=1
+        ssh_push_setup || warn "Optionaler SSH-Fallback fehlgeschlagen - cloud-init übernimmt weiterhin die Installation."
+      fi
+    fi
+
     if (( i % 12 == 0 )); then
-      info "Warte auf opencode-setup ... (${i}/120)"
+      if guest_agent_ready; then
+        ci_status="$(gexec_out 5 "cloud-init status 2>&1 || true")"
+      fi
+      info "Warte auf opencode-setup ... (${i}/180)${ci_status:+ — cloud-init: ${ci_status}}"
     fi
     sleep 5
   done
 
-  warn "opencode-setup wurde in 10 Minuten nicht abgeschlossen."
+  warn "opencode-setup wurde in 15 Minuten nicht abgeschlossen."
   return 1
 }
 
