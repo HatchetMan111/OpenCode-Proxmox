@@ -16,8 +16,9 @@ The installer runs on a Proxmox VE host and automatically:
 - runs `opencode web` as a systemd service
 - starts OpenCode automatically after reboots
 - creates `/home/opencode/projects`
+- installs a dufs file server (upload, photo preview, browser text editor, WebDAV) on port 8080
 - protects the Web UI with HTTP Basic Authentication
-- enables a VM firewall that only permits OpenCode from private IPv4 networks
+- enables a VM firewall that only permits OpenCode and the file server from private IPv4 networks
 - prints the VM IP and Web UI URL when installation is complete
 
 Ubuntu publishes official 24.04 LTS Cloud Images and SHA256 checksums:
@@ -100,7 +101,7 @@ The VM listens on:
 
 because that is required for other devices on the LAN to reach the Web UI.
 
-The VM's UFW firewall only allows TCP/4096 from:
+The VM's UFW firewall only allows TCP/4096 (OpenCode) and TCP/8080 (file server) from:
 
 - `10.0.0.0/8`
 - `172.16.0.0/12`
@@ -110,7 +111,7 @@ SSH is restricted to the same private IPv4 ranges.
 
 ### Router
 
-Do **not** create a port-forward from the Internet to port `4096`.
+Do **not** create a port-forward from the Internet to port `4096` or `8080`.
 
 For remote access, use a VPN such as WireGuard or Tailscale rather than exposing OpenCode directly to the Internet.
 
@@ -125,8 +126,10 @@ For remote access, use a VPN such as WireGuard or Tailscale rather than exposing
 | Network | DHCP |
 | Bridge | `vmbr0` |
 | OpenCode port | `4096` |
+| File server port | `8080` |
 | VM name | `opencode` |
 | Project directory | `/home/opencode/projects` |
+| File server directory | `/home/opencode/files` |
 
 ## OpenCode service
 
@@ -163,6 +166,37 @@ Check the installed version:
 ```bash
 /usr/local/bin/opencode-version
 ```
+
+## File server (dufs)
+
+The VM also runs a [dufs](https://github.com/sigoden/dufs) file server on port `8080`:
+
+- Web UI in the browser: upload via drag & drop, photo preview, text editor, folder download as ZIP
+- WebDAV access and `curl` up-/downloads
+- files live in `/home/opencode/files` (same place is reachable from OpenCode)
+
+Default login:
+
+```text
+user:     admin
+password: admin
+```
+
+Change it right after installation (alphanumeric password recommended):
+
+```bash
+qm terminal <VMID>
+sudo fileserver-password <neues-passwort>
+```
+
+Service status and logs:
+
+```bash
+systemctl status fileserver
+journalctl -u fileserver -f
+```
+
+Note: FileBrowser was deliberately **not** used — the project has been archived (read-only since 2026-09-01) with unpatched security issues. dufs is actively maintained and a single static binary with no extra dependencies.
 
 ## Accessing the VM
 

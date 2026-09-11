@@ -3,7 +3,7 @@
 # Copyright (c) 2026 proxmox-opencode contributors
 #
 # Proxmox OpenCode Community Script
-# Installs OpenCode Web in an Ubuntu 24.04 LTS VM.
+# Installs OpenCode Web + a dufs file server in an Ubuntu 24.04 LTS VM.
 #
 # Usage:
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/OpenCode-Proxmox/main/install.sh)"
@@ -11,11 +11,14 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.9.1"
+readonly SCRIPT_VERSION="1.10.0"
 readonly VM_NAME_DEFAULT="opencode"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
 readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
 readonly OPENCODE_PORT="4096"
+readonly FILESERVER_PORT="8080"
+# dufs publishes no checksum file - version is pinned instead.
+readonly DUFS_VERSION="v0.46.0"
 
 VMID=""
 SSH_KEY="/root/.ssh/id_ed25519"
@@ -367,7 +370,7 @@ write_files:
       fi
 
       export DEBIAN_FRONTEND=noninteractive
-      echo "[1/7] Installiere Abhaengigkeiten ..."
+      echo "[1/8] Installiere Abhaengigkeiten ..."
       apt-get update
       apt-get install -y ca-certificates curl git jq ripgrep unzip ufw qemu-guest-agent iproute2 psmisc
 
@@ -376,8 +379,9 @@ write_files:
       BIN="\$HOME_DIR/.opencode/bin/opencode"
       PROJECTS="\$HOME_DIR/projects"
 
-      echo "[2/7] Erstelle Verzeichnisse und Konfiguration ..."
+      echo "[2/8] Erstelle Verzeichnisse und Konfiguration ..."
       install -d -o "\$USER" -g "\$USER" "\$PROJECTS"
+      install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/files"
       install -d -o "\$USER" -g "\$USER" "\$HOME_DIR/.config"
       install -d -o "\$USER" -g "\$USER" -m 0700 "\$HOME_DIR/.local"
       install -d -o "\$USER" -g "\$USER" -m 0700 "\$HOME_DIR/.local/state"
@@ -397,13 +401,26 @@ write_files:
       JSON
       chown "\$USER:\$USER" "\$HOME_DIR/.config/opencode/opencode.json"
 
-      echo "[3/7] Installiere OpenCode ..."
+      echo "[3/8] Installiere OpenCode ..."
       if [[ ! -x "\$BIN" ]]; then
         runuser -u "\$USER" -- env HOME="\$HOME_DIR" bash -lc 'curl -fsSL https://opencode.ai/install | bash'
       fi
       test -x "\$BIN"
 
-      echo "[4/7] Erstelle systemd-Unit ..."
+      echo "[4/8] Installiere Dateiserver (dufs ${DUFS_VERSION}) ..."
+      # dufs ist eine einzige statische Binary (kein Python/Node noetig).
+      # Hinweis: dufs veroeffentlicht keine Checksum-Datei, die Version ist
+      # deshalb oben im Script gepinnt (DUFS_VERSION).
+      if [[ ! -x /usr/local/bin/dufs ]]; then
+        tmp_dir="\$(mktemp -d)"
+        curl -fsSL -o "\$tmp_dir/dufs.tar.gz" "https://github.com/sigoden/dufs/releases/download/${DUFS_VERSION}/dufs-${DUFS_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        tar xzf "\$tmp_dir/dufs.tar.gz" -C "\$tmp_dir"
+        install -m 0755 -o root -g root "\$tmp_dir/dufs" /usr/local/bin/dufs
+        rm -rf "\$tmp_dir"
+      fi
+      /usr/local/bin/dufs --version
+
+      echo "[5/8] Erstelle systemd-Units ..."
       cat >/etc/systemd/system/opencode.service <<'UNIT'
       [Unit]
       Description=OpenCode Web Server
@@ -443,7 +460,46 @@ write_files:
       VERSION
       chmod 0755 /usr/local/bin/opencode-version
 
-      echo "[5/7] Konfiguriere Firewall ..."
+      # Dateiserver: dufs serviert /home/opencode/files mit Web-UI
+      # (Upload per Drag&Drop, Foto-Vorschau, Text-Editor, WebDAV).
+      # Standard-Login: Benutzer "admin", Passwort "admin" (LAN-only,
+      # bitte nach der Installation aendern - siehe fileserver-password).
+      cat >/etc/systemd/system/fileserver.service <<'UNIT'
+      [Unit]
+      Description=dufs File Server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=opencode
+      Group=opencode
+      WorkingDirectory=/home/opencode/files
+      Environment=HOME=/home/opencode
+      ExecStart=/usr/local/bin/dufs /home/opencode/files --bind 0.0.0.0 --port ${FILESERVER_PORT} --allow-all --auth 'admin:admin@/:rw'
+      Restart=always
+      RestartSec=5
+      UMask=0077
+
+      [Install]
+      WantedBy=multi-user.target
+      UNIT
+
+      cat >/usr/local/bin/fileserver-password <<'UPDATEPW'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      new="\${1:?Aufruf: sudo fileserver-password <neues-passwort> (nur Buchstaben/Zahlen empfohlen)}"
+      unit=/etc/systemd/system/fileserver.service
+      grep -q "admin:" "\$unit" || { echo "FEHLER: kein admin-Login in \$unit gefunden" >&2; exit 1; }
+      cp -f "\$unit" "\$unit.bak"
+      sed -i -E "s#--auth 'admin:[^']*@/:rw'#--auth 'admin:\${new}@/:rw'#" "\$unit"
+      systemctl daemon-reload
+      systemctl restart fileserver.service
+      echo "Fileserver-Passwort geaendert (Backup: \$unit.bak)."
+      UPDATEPW
+      chmod 0755 /usr/local/bin/fileserver-password
+
+      echo "[6/8] Konfiguriere Firewall ..."
       # Local-network-only firewall. No public/WAN address is intentionally opened.
       ufw --force reset
       ufw default deny incoming
@@ -451,18 +507,22 @@ write_files:
       ufw allow from 10.0.0.0/8 to any port 4096 proto tcp
       ufw allow from 172.16.0.0/12 to any port 4096 proto tcp
       ufw allow from 192.168.0.0/16 to any port 4096 proto tcp
+      ufw allow from 10.0.0.0/8 to any port ${FILESERVER_PORT} proto tcp
+      ufw allow from 172.16.0.0/12 to any port ${FILESERVER_PORT} proto tcp
+      ufw allow from 192.168.0.0/16 to any port ${FILESERVER_PORT} proto tcp
       ufw allow from 10.0.0.0/8 to any port 22 proto tcp
       ufw allow from 172.16.0.0/12 to any port 22 proto tcp
       ufw allow from 192.168.0.0/16 to any port 22 proto tcp
       ufw --force enable
 
-      echo "[6/7] Bereite Verzeichnisse vor ..."
+      echo "[7/8] Bereite Verzeichnisse vor ..."
       chown -R "\$USER:\$USER" "\$HOME_DIR"
 
-      echo "[7/7] Starte Dienste ..."
+      echo "[8/8] Starte Dienste ..."
       systemctl daemon-reload
       systemctl enable --now qemu-guest-agent.service
       systemctl enable opencode.service
+      systemctl enable fileserver.service
       # Port-Check: Falls bereits eine (alte) Instanz auf dem Port lauscht,
       # neu starten statt starten - sonst stirbt der Dienst mit ServeError,
       # weil der Port schon belegt ist. systemd ist die EINZIGE Instanz, die
@@ -478,6 +538,16 @@ write_files:
         systemctl restart opencode.service
       else
         systemctl start opencode.service
+      fi
+
+      # Gleiches Spiel fuer den Dateiserver-Port.
+      if ss -lntp 2>/dev/null | grep -q ":${FILESERVER_PORT} "; then
+        echo "Port ${FILESERVER_PORT} ist belegt - beende fremde Prozesse ..."
+        fuser -k "${FILESERVER_PORT}/tcp" 2>/dev/null || true
+        sleep 1
+        systemctl restart fileserver.service
+      else
+        systemctl start fileserver.service
       fi
 
       # Store a non-secret readiness marker.
@@ -589,6 +659,11 @@ vm_triage() {
     echo "opencode.service:"
     gexec_out 5 "systemctl is-active opencode 2>/dev/null || echo '<inaktiv>'"
     gexec_out 6 "journalctl -u opencode -n 20 --no-pager 2>/dev/null || echo '<kein Journal>'"
+
+    echo
+    echo "fileserver.service:"
+    gexec_out 5 "systemctl is-active fileserver 2>/dev/null || echo '<inaktiv>'"
+    gexec_out 6 "journalctl -u fileserver -n 10 --no-pager 2>/dev/null || echo '<kein Journal>'"
 
     echo
     echo "/var/log/cloud-init.log (Ende, evtl. Fehlerursache):"
@@ -722,6 +797,27 @@ wait_for_setup() {
   return 1
 }
 
+# Wartet auf den Dateiserver (dufs). Nicht fatal: Nur Warnung, wenn er nach
+# 2 Minuten noch nicht antwortet - die OpenCode-Installation ist davon
+# unabhaengig. Der Health-Endpoint ist bewusst ohne Login abfragbar.
+wait_for_fileserver() {
+  local i
+  info "Warte auf Dateiserver (Port ${FILESERVER_PORT}) ..."
+
+  for i in {1..60}; do
+    if curl -fsS --max-time 3 \
+      "http://${VM_IP}:${FILESERVER_PORT}/__dufs__/health" 2>/dev/null | grep -q '"status":"OK"'; then
+      ok "Dateiserver ist erreichbar."
+      return 0
+    fi
+    sleep 2
+  done
+
+  warn "Dateiserver antwortet noch nicht (Port ${FILESERVER_PORT})."
+  warn "Prüfe in der VM: systemctl status fileserver / journalctl -u fileserver -e"
+  return 1
+}
+
 wait_for_service() {
   local port=0 http_code i
   info "Warte auf OpenCode Web (bis zu 10 Minuten, erste Einrichtung läuft) ..."
@@ -732,12 +828,14 @@ wait_for_service() {
       if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
         "http://${VM_IP}:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
         ok "OpenCode Web ist erreichbar."
+        wait_for_fileserver || true
         return
       fi
       http_code="$(curl -s --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
         -o /dev/null -w '%{http_code}' "http://${VM_IP}:${OPENCODE_PORT}/" 2>/dev/null || true)"
       if [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
         ok "OpenCode Web antwortet (HTTP ${http_code})."
+        wait_for_fileserver || true
         return
       fi
     fi
@@ -788,6 +886,23 @@ print_result() {
        Benutzer:      opencode
        Web-Passwort:  ${SERVER_PASSWORD}
 
+  📁  Dateiserver (dufs) im Browser öffnen:
+
+       http://${VM_IP}:${FILESERVER_PORT}
+
+       Benutzer:   admin
+       Passwort:   admin
+
+       Dateien liegen in: /home/opencode/files
+       (Upload per Drag&Drop, Foto-Vorschau, Text-Editor, WebDAV)
+
+  ⚠️  Standard-Passwort des Dateiservers ändern (Pflicht trotz LAN-only):
+
+       qm terminal ${VMID}
+       sudo fileserver-password <neues-passwort>
+
+       Nur Buchstaben/Zahlen verwenden. Danach neu einloggen.
+
 ------------------------------------------------------------
   VM:
     ${VMID} (${VM_NAME})
@@ -798,17 +913,25 @@ print_result() {
   Projekte:
     /home/opencode/projects
 
+  Dateien (Dateiserver):
+    /home/opencode/files
+
   Update:
     sudo /usr/local/bin/opencode-update
 
   Version:
     /usr/local/bin/opencode-version
 
-  Service:
+  Dateiserver-Passwort ändern:
+    sudo /usr/local/bin/fileserver-password <neues-passwort>
+
+  Services:
     systemctl status opencode
+    systemctl status fileserver
 
   Logs:
     journalctl -u opencode -f
+    journalctl -u fileserver -f
 
   Modellanbieter:
     Öffne die Web-UI und nutze /connect.
@@ -819,10 +942,11 @@ print_result() {
  LAN-ONLY
 ============================================================
 
-  Port ${OPENCODE_PORT} wird nur aus privaten IPv4-Netzen
+  Port ${OPENCODE_PORT} (OpenCode) und Port ${FILESERVER_PORT} (Dateiserver)
+  werden nur aus privaten IPv4-Netzen
   (10/8, 172.16/12, 192.168/16) durch die VM-Firewall erlaubt.
 
-  Trotzdem keinen Router-Port-Forward auf ${OPENCODE_PORT} setzen.
+  Trotzdem keinen Router-Port-Forward auf diese Ports setzen.
 
 ============================================================
  TROUBLESHOOTING
@@ -836,7 +960,9 @@ print_result() {
 
     a. IP prüfen:  ip a
     b. Dienst:     systemctl status opencode
+                   systemctl status fileserver
     c. Logs:       journalctl -u opencode -e
+                   journalctl -u fileserver -e
     d. Setup-Log:  cat /var/log/opencode-setup.log
 
   Die Ersteinrichtung installiert nach dem ersten Boot noch

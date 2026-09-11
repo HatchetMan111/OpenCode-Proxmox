@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.10.0
+
+- **Neu: Dateiserver (dufs v0.46.0) auf Port 8080.** Web-UI mit Upload per
+  Drag&Drop, Foto-Vorschau, Text-Editor im Browser und WebDAV-Zugriff.
+  Dateien liegen in `/home/opencode/files`. Standard-Login `admin` / `admin`
+  (LAN-only via UFW, bitte nach der Installation mit
+  `sudo fileserver-password <neues-passwort>` ändern).
+- Bewusst **kein FileBrowser**: Das Projekt ist seit 01.09.2026 archiviert
+  (read-only, keine Security-Fixes, offene Lücken bei Command-Execution und
+  Sessions). dufs ist aktiv gepflegt und eine einzige statische Binary ohne
+  Zusatzabhängigkeiten.
+- Neuer systemd-Dienst `fileserver.service` (User `opencode`), mit demselben
+  Port-Konflikt-Schutz per `fuser -k` wie `opencode.service`.
+- `wait_for_service()` wartet zusätzlich auf den dufs-Health-Endpoint
+  (`/__dufs__/health`, ohne Login abfragbar) — nicht fatal, nur Warnung.
+- Diagnose (`vm_triage`) und Ergebnis-Ausgabe um den Dateiserver erweitert.
+
 ## 1.9.1
 
 - **SSH ist jetzt optional statt Pflicht (wichtigste Änderung):**
