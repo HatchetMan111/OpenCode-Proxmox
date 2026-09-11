@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.10.1
+
+- Dateiserver-Login vereinfacht: `opencode` / `opencode` statt
+  `admin` / `admin` (reines Heimnetz, per UFW auf private Netze begrenzt).
+- Die Dateiserver-Weboberfläche (`http://<VM-IP>:8080`) wird in der
+  Abschluss-Ausgabe zusammen mit Login und Dateien-Verzeichnis angezeigt.
+
 ## 1.10.0
 
 - **Neu: Dateiserver (dufs v0.46.0) auf Port 8080.** Web-UI mit Upload per

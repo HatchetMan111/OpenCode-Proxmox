@@ -53,6 +53,10 @@ At the end, the installer prints something like:
   Web-Passwort:
     xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
+  Dateiserver:
+    http://192.168.178.123:8080
+    (Login: opencode / opencode)
+
   VM:
     120 (opencode)
 
@@ -178,8 +182,8 @@ The VM also runs a [dufs](https://github.com/sigoden/dufs) file server on port `
 Default login:
 
 ```text
-user:     admin
-password: admin
+user:     opencode
+password: opencode
 ```
 
 Change it right after installation (alphanumeric password recommended):

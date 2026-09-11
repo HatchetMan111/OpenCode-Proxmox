@@ -11,7 +11,7 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.10.0"
+readonly SCRIPT_VERSION="1.10.1"
 readonly VM_NAME_DEFAULT="opencode"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
 readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
@@ -462,8 +462,8 @@ write_files:
 
       # Dateiserver: dufs serviert /home/opencode/files mit Web-UI
       # (Upload per Drag&Drop, Foto-Vorschau, Text-Editor, WebDAV).
-      # Standard-Login: Benutzer "admin", Passwort "admin" (LAN-only,
-      # bitte nach der Installation aendern - siehe fileserver-password).
+      # Standard-Login: Benutzer "opencode", Passwort "opencode" (LAN-only,
+      # aenderbar per fileserver-password).
       cat >/etc/systemd/system/fileserver.service <<'UNIT'
       [Unit]
       Description=dufs File Server
@@ -476,7 +476,7 @@ write_files:
       Group=opencode
       WorkingDirectory=/home/opencode/files
       Environment=HOME=/home/opencode
-      ExecStart=/usr/local/bin/dufs /home/opencode/files --bind 0.0.0.0 --port ${FILESERVER_PORT} --allow-all --auth 'admin:admin@/:rw'
+      ExecStart=/usr/local/bin/dufs /home/opencode/files --bind 0.0.0.0 --port ${FILESERVER_PORT} --allow-all --auth 'opencode:opencode@/:rw'
       Restart=always
       RestartSec=5
       UMask=0077
@@ -490,9 +490,9 @@ write_files:
       set -euo pipefail
       new="\${1:?Aufruf: sudo fileserver-password <neues-passwort> (nur Buchstaben/Zahlen empfohlen)}"
       unit=/etc/systemd/system/fileserver.service
-      grep -q "admin:" "\$unit" || { echo "FEHLER: kein admin-Login in \$unit gefunden" >&2; exit 1; }
+      grep -q "opencode:" "\$unit" || { echo "FEHLER: kein opencode-Login in \$unit gefunden" >&2; exit 1; }
       cp -f "\$unit" "\$unit.bak"
-      sed -i -E "s#--auth 'admin:[^']*@/:rw'#--auth 'admin:\${new}@/:rw'#" "\$unit"
+      sed -i -E "s#--auth 'opencode:[^']*@/:rw'#--auth 'opencode:\${new}@/:rw'#" "\$unit"
       systemctl daemon-reload
       systemctl restart fileserver.service
       echo "Fileserver-Passwort geaendert (Backup: \$unit.bak)."
@@ -890,13 +890,13 @@ print_result() {
 
        http://${VM_IP}:${FILESERVER_PORT}
 
-       Benutzer:   admin
-       Passwort:   admin
+       Benutzer:   opencode
+       Passwort:   opencode
 
        Dateien liegen in: /home/opencode/files
        (Upload per Drag&Drop, Foto-Vorschau, Text-Editor, WebDAV)
 
-  ⚠️  Standard-Passwort des Dateiservers ändern (Pflicht trotz LAN-only):
+  🔑  Dateiserver-Passwort ändern (optional, nur Heimnetz - Standard reicht meist):
 
        qm terminal ${VMID}
        sudo fileserver-password <neues-passwort>
