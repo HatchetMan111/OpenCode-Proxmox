@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.0.0
+
+- **OpenCode v2:** Der Installer nutzt jetzt den offiziellen v2-Installer
+  (`https://opencode.ai/v2/install`, Konstante `OPENCODE_INSTALLER` in
+  `install.sh`) statt dem v1-Installer. Es kommt also immer das aktuellste
+  v2-Release (`@opencode/cli`) in die VM.
+- **Systemd läuft jetzt `opencode serve` statt `opencode web`:** `serve` ist
+  laut offizieller v2-Doku die Foreground-Variante für Supervisoren wie
+  systemd/Docker (`opencode serve --hostname 0.0.0.0 --port 4096`).
+  `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD` aus
+  `/etc/opencode/server.env` aktivieren weiterhin HTTP Basic Auth (opt-in).
+- **Config angepasst:** `~/.config/opencode/opencode.json` enthält kein
+  `server`-Objekt und kein `autoupdate: false` mehr (v1-Schema), sondern nur
+  noch `"update": "disable"` (v2-Schema). Hostname/Port kommen aus den
+  `serve`-Flags der systemd-Unit.
+- **Health-Check angepasst:** Gewartet wird auf HTTP-Antwort von `/`
+  (mit Basic Auth). Der v1-Endpoint `/global/health` existiert in v2 nicht
+  mehr (v2 nutzt `/api/health` bzw. Session-Cookie/pair-Auth) — jede
+  HTTP-Antwort (200/401/302/...) zählt als "Dienst lebt".
+- README auf v2-Doku-Links (`/v2/docs/...`) und `serve`-Befehl umgestellt.
+- `SCRIPT_VERSION` auf `2.0.0` angehoben.
+
 ## 1.10.1
 
 - Dateiserver-Login vereinfacht: `opencode` / `opencode` statt

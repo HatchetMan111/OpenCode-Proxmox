@@ -1,6 +1,6 @@
-# Proxmox OpenCode
+# Proxmox OpenCode v2
 
-One-command installer for running **OpenCode Web** permanently inside an isolated Ubuntu 24.04 LTS virtual machine on Proxmox VE.
+One-command installer for running **OpenCode v2 (`opencode serve`)** permanently inside an isolated Ubuntu 24.04 LTS virtual machine on Proxmox VE.
 
 ## What it does
 
@@ -12,8 +12,8 @@ The installer runs on a Proxmox VE host and automatically:
 - verifies the image with Ubuntu's published SHA256 checksum
 - configures Cloud-Init
 - installs QEMU Guest Agent
-- installs OpenCode using the official installer
-- runs `opencode web` as a systemd service
+- installs OpenCode v2 using the official v2 installer (`https://opencode.ai/v2/install`)
+- runs `opencode serve` as a systemd service (foreground server, ideal for systemd)
 - starts OpenCode automatically after reboots
 - creates `/home/opencode/projects`
 - installs a dufs file server (upload, photo preview, browser text editor, WebDAV) on port 8080
@@ -24,8 +24,8 @@ The installer runs on a Proxmox VE host and automatically:
 Ubuntu publishes official 24.04 LTS Cloud Images and SHA256 checksums:
 https://cloud-images.ubuntu.com/releases/server/24.04/release/
 
-OpenCode documents `opencode web --hostname 0.0.0.0`, port 4096, HTTP Basic Authentication and mDNS:
-https://opencode.ai/docs/web/
+OpenCode v2 documents `opencode serve --hostname 0.0.0.0`, port 4096 and HTTP Basic Authentication via `OPENCODE_SERVER_PASSWORD`:
+https://opencode.ai/v2/docs/cli/web/
 
 ## One-line installation
 
@@ -81,13 +81,13 @@ Models can then be selected using:
 /models
 ```
 
-See the official OpenCode provider documentation:
+See the official OpenCode v2 provider documentation:
 
-https://opencode.ai/docs/providers/
+https://opencode.ai/v2/docs/providers/
 
 and model documentation:
 
-https://opencode.ai/docs/models/
+https://opencode.ai/v2/docs/models/
 
 This means the same server can be used with the providers available to your OpenCode installation instead of limiting the VM to one model vendor.
 
@@ -152,10 +152,10 @@ journalctl -u opencode -f
 The server is configured with:
 
 ```bash
-opencode web --hostname 0.0.0.0 --port 4096
+opencode serve --hostname 0.0.0.0 --port 4096
 ```
 
-OpenCode's official Web documentation describes the same server mode and HTTP Basic Authentication via `OPENCODE_SERVER_PASSWORD`.
+OpenCode's official v2 documentation describes the same server mode (`serve` is the foreground variant for supervisors like systemd) and HTTP Basic Authentication via `OPENCODE_SERVER_PASSWORD`.
 
 ## Updating OpenCode
 

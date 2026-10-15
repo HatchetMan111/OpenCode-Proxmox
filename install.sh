@@ -3,7 +3,7 @@
 # Copyright (c) 2026 proxmox-opencode contributors
 #
 # Proxmox OpenCode Community Script
-# Installs OpenCode Web + a dufs file server in an Ubuntu 24.04 LTS VM.
+# Installs OpenCode v2 (serve) + a dufs file server in an Ubuntu 24.04 LTS VM.
 #
 # Usage:
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/OpenCode-Proxmox/main/install.sh)"
@@ -11,7 +11,8 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="OpenCode"
-readonly SCRIPT_VERSION="1.10.1"
+readonly SCRIPT_VERSION="2.0.0"
+readonly OPENCODE_INSTALLER="https://opencode.ai/v2/install"
 readonly VM_NAME_DEFAULT="opencode"
 readonly UBUNTU_BASE="https://cloud-images.ubuntu.com/releases/server/24.04/release"
 readonly UBUNTU_IMAGE="ubuntu-24.04-server-cloudimg-amd64.img"
@@ -391,19 +392,14 @@ write_files:
       cat >"\$HOME_DIR/.config/opencode/opencode.json" <<'JSON'
       {
         "\$schema": "https://opencode.ai/config.json",
-        "autoupdate": false,
-        "server": {
-          "port": ${OPENCODE_PORT},
-          "hostname": "0.0.0.0",
-          "mdns": false
-        }
+        "update": "disable"
       }
       JSON
       chown "\$USER:\$USER" "\$HOME_DIR/.config/opencode/opencode.json"
 
-      echo "[3/8] Installiere OpenCode ..."
+      echo "[3/8] Installiere OpenCode v2 (offizieller v2-Installer) ..."
       if [[ ! -x "\$BIN" ]]; then
-        runuser -u "\$USER" -- env HOME="\$HOME_DIR" bash -lc 'curl -fsSL https://opencode.ai/install | bash'
+        runuser -u "\$USER" -- env HOME="\$HOME_DIR" bash -lc 'curl -fsSL ${OPENCODE_INSTALLER} | bash'
       fi
       test -x "\$BIN"
 
@@ -423,7 +419,7 @@ write_files:
       echo "[5/8] Erstelle systemd-Units ..."
       cat >/etc/systemd/system/opencode.service <<'UNIT'
       [Unit]
-      Description=OpenCode Web Server
+      Description=OpenCode v2 Server (serve)
       After=network-online.target
       Wants=network-online.target
 
@@ -435,7 +431,7 @@ write_files:
       Environment=HOME=/home/opencode
       Environment=PATH=/home/opencode/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       EnvironmentFile=/etc/opencode/server.env
-      ExecStart=/home/opencode/.opencode/bin/opencode web --hostname 0.0.0.0 --port ${OPENCODE_PORT}
+      ExecStart=/home/opencode/.opencode/bin/opencode serve --hostname 0.0.0.0 --port ${OPENCODE_PORT}
       Restart=always
       RestartSec=5
       UMask=0077
@@ -447,7 +443,7 @@ write_files:
       cat >/usr/local/bin/opencode-update <<'UPDATE'
       #!/usr/bin/env bash
       set -euo pipefail
-      runuser -u opencode -- env HOME=/home/opencode bash -lc 'curl -fsSL https://opencode.ai/install | bash'
+      runuser -u opencode -- env HOME=/home/opencode bash -lc 'curl -fsSL ${OPENCODE_INSTALLER} | bash'
       systemctl restart opencode.service
       /home/opencode/.opencode/bin/opencode --version
       UPDATE
@@ -526,9 +522,9 @@ write_files:
       # Port-Check: Falls bereits eine (alte) Instanz auf dem Port lauscht,
       # neu starten statt starten - sonst stirbt der Dienst mit ServeError,
       # weil der Port schon belegt ist. systemd ist die EINZIGE Instanz, die
-      # OpenCode verwaltet - nie manuell "opencode web ..." ausfuehren.
+      # OpenCode verwaltet - nie manuell "opencode serve ..." ausfuehren.
       if ss -lntp 2>/dev/null | grep -q ":${OPENCODE_PORT} "; then
-        echo "Port ${OPENCODE_PORT} ist belegt - beende fremde Prozesse (z.B. manuell gestartetes 'opencode web') ..."
+        echo "Port ${OPENCODE_PORT} ist belegt - beende fremde Prozesse (z.B. manuell gestartetes 'opencode serve') ..."
         # fuser -k beendet ALLE Prozesse auf dem Port, auch solche, die
         # nicht zu opencode.service gehoeren. Nur so kann systemd danach
         # sauber binden - ein einfaches 'restart' wuerde einen Fremdprozess
@@ -609,7 +605,7 @@ create_vm() {
     --nameserver "1.1.1.1 9.9.9.9" \
     --cicustom "user=${SNIPPET_STORAGE}:snippets/$(basename "$SNIPPET_PATH")" \
     --boot "order=scsi0" \
-    --description "OpenCode Web - Ubuntu 24.04 LTS - LAN only" \
+    --description "OpenCode v2 (serve) - Ubuntu 24.04 LTS - LAN only" \
     >/dev/null
 
   qm resize "$VMID" scsi0 "$DISK" >/dev/null
@@ -820,21 +816,18 @@ wait_for_fileserver() {
 
 wait_for_service() {
   local port=0 http_code i
-  info "Warte auf OpenCode Web (bis zu 10 Minuten, erste Einrichtung läuft) ..."
+  # v2: `opencode serve` hat keinen /global/health-Endpoint mit Basic-Auth
+  # mehr wie v1 (`opencode web`). Auth läuft über Session-Cookie/pair.
+  # Darum gilt: jede HTTP-Antwort (200/401/302/...) = Dienst lebt.
+  info "Warte auf OpenCode v2 (serve) (bis zu 10 Minuten, erste Einrichtung läuft) ..."
 
   for i in {1..300}; do
     if timeout 3 bash -c "</dev/tcp/${VM_IP}/${OPENCODE_PORT}" >/dev/null 2>&1; then
       port=1
-      if curl -fsS --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
-        "http://${VM_IP}:${OPENCODE_PORT}/global/health" >/dev/null 2>&1; then
-        ok "OpenCode Web ist erreichbar."
-        wait_for_fileserver || true
-        return
-      fi
       http_code="$(curl -s --max-time 3 -u "opencode:${SERVER_PASSWORD}" \
         -o /dev/null -w '%{http_code}' "http://${VM_IP}:${OPENCODE_PORT}/" 2>/dev/null || true)"
       if [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
-        ok "OpenCode Web antwortet (HTTP ${http_code})."
+        ok "OpenCode v2 antwortet (HTTP ${http_code})."
         wait_for_fileserver || true
         return
       fi
@@ -848,7 +841,7 @@ wait_for_service() {
     sleep 2
   done
 
-  warn "OpenCode Web ist noch nicht bereit."
+  warn "OpenCode v2 ist noch nicht bereit."
   if [[ "$port" -eq 1 ]]; then
     warn "Der Port ${OPENCODE_PORT} ist offen, aber der Dienst startet vermutlich gerade."
   else
